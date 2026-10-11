@@ -5,66 +5,82 @@
 
 ## Features
 
-- **21 maps**, each with its own visual theme, including icy, desert, and volcanic environments.
-- **Tower building and upgrades**, with five levels for each tower and different roles such as damage, support, economy, and summoning.
-- **Multiple difficulties** to challenge different strategies and loadouts.
-- **Perks and ability perks** that let you customize how you play.
+- **21 maps** with distinct visual themes.
+- **Tower building and upgrades**, with five levels per tower and roles such as damage, support, economy, and summoning.
+- **Multiple difficulties** for different challenges and strategies.
+- **Perks and ability perks** to customize your playstyle.
 - **Solo play and local Wi-Fi multiplayer** for up to four players.
-- **Cooperative defense:** multiplayer teams share a core, while each player manages their own cash, loadout, perks, and towers.
+- **Cooperative defense:** players share a core, while each player manages their own cash, loadout, perks, and towers.
 - **2D and 3D views**, plus adjustable camera controls.
-- **Player movement:** sprint and jump around the battlefield while managing your defenses.
+- **Player movement:** sprint and jump around the battlefield.
 - **Targeting options** to prioritize enemies by first, last, strongest, or closest.
 - **Wave speed controls** and the ability to skip eligible waves.
-- **Customizable controls**, with key hints updated to match your settings.
+- **Customizable controls** shown in the in-game controls screen.
 - **Map and event variety**, with themed visuals for towers and enemies.
 - **In-game chat** with a word filter.
-- **LAN update support** for sharing game updates between PCs on the same network.
+- **Local-network update support** for sharing game updates between PCs.
 
 ## How to Play
 
 1. Choose a map and difficulty.
 2. Select towers for your loadout.
 3. Place towers where they can defend the route.
-4. Earn cash by hitting enemies, then spend it on more towers and upgrades.
-5. Use support towers, perks, targeting, and abilities to improve your defense.
-6. Keep enemies from overwhelming your core.
+4. Earn cash and spend it on more towers and upgrades.
+5. Use support towers, perks, targeting, and abilities to strengthen your defense.
+6. Stop enemies from overwhelming your core.
 
-In multiplayer, up to four players can cooperate over the same Wi-Fi network. One player hosts a game, and the others join from the **Wi-Fi Play** menu. Everyone needs to use the same game version and be on the same local network.
+### Playing with Friends
 
-## Controls
+NEON BASTION supports up to four players over the same local Wi-Fi network.
 
-Controls can be changed in **Options → Controls**. The game displays the keys assigned to each action.
+1. One player opens **Wi-Fi Play** and selects **Host a Game**.
+2. Other players open **Wi-Fi Play** and join the hosted game.
+3. If the host does not appear automatically, players can enter the host's displayed network address.
+4. The host chooses the map and difficulty and starts the match.
 
-| Action | Default control |
-| --- | --- |
-| Sprint | Hold `Shift` |
-| Jump | `Space` |
-| Start the next wave in solo play | `G` |
-| Place or select a tower | Left-click |
-| Cancel placement or selection | Right-click or `Esc` |
-| Fullscreen | `F11` |
+Players need compatible versions of the game and a local network that allows devices to communicate.
 
-Other actions, including tower selection, upgrades, selling, abilities, targeting, camera zoom, and chat, are configurable or shown in the in-game controls screen.
+## Getting the Game
 
-## Running from Source
+There are two ways to run NEON BASTION on Windows:
 
-NEON BASTION is written in Python and uses Pygame.
+### Windows executable (`.exe`)
+
+If you have a packaged Windows `.exe` build, you can launch the game directly without manually running the Python source file. Keep any files distributed alongside the executable in the same folder unless the release instructions say otherwise.
+
+### Python source (`.py`)
+
+The source version requires Python and Pygame.
 
 1. Install Python.
-2. Install Pygame if it is not already installed:
+2. Open Command Prompt in the folder containing the game source.
+3. Install Pygame if needed:
 
    ```bash
    py -m pip install pygame
    ```
 
-3. Open a terminal in the folder containing the game source.
-4. Run the game file, for example:
+4. Run the source file. For example:
 
    ```bash
    py neon_bastion.py
    ```
 
-The source filename may differ depending on the version you have.
+The source filename may differ between versions.
+
+## Controls
+
+Controls can be changed in **Options → Controls**. The in-game controls screen displays the keys assigned to each action.
+
+| Action | Control |
+| --- | --- |
+| Sprint | Hold `Shift` by default |
+| Jump | `Space` by default |
+| Place or select a tower | Left-click |
+| Cancel placement or selection | Right-click or `Esc` |
+| Fullscreen | `F11` |
+
+Other actions, including tower selection, upgrades, selling, abilities, targeting, camera zoom, chat, and wave controls, are shown in the game and may be configurable.
 
 ## Project
 
@@ -72,9 +88,9 @@ The source filename may differ depending on the version you have.
 - **Game title:** NEON BASTION
 - **Technology:** Python + Pygame
 
-This project is actively developed, so features and details may change between versions.
+This project is actively developed, so features and details may change between versions. If a packaged `.exe` is published, check the project's releases or release notes for the matching build and version.
 
 ## Notes
 
-- Local Wi-Fi multiplayer requires players to be on the same local network and use compatible versions.
-- This repository is the game's source-code project. A packaged executable, if provided separately, may be easier to run without setting up Python.
+- The GitHub repository contains the project source code. A packaged executable may be distributed separately.
+- Local Wi-Fi multiplayer requires players to use compatible game versions and the same local network.
