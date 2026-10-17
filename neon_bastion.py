@@ -15,6 +15,7 @@ import random
 import json
 import array
 import time
+import datetime
 import socket
 import functools
 import struct
@@ -38,7 +39,7 @@ except ImportError:
         pass
     sys.exit(1)
 
-VERSION = "2.4.0"
+VERSION = "3.0.0"
 CODE_NAME = "neon_bastion.py"            # the file an update replaces
 _NB_EXT = globals().get("_NB_EXT")       # set when the .exe is running a newer neon_bastion.py that sits next to it
 
@@ -128,6 +129,7 @@ KEY_GROUPS = [
     ("YOU", 0, [("up", "Walk forward", pygame.K_w), ("left", "Walk left", pygame.K_a), ("down", "Walk back", pygame.K_s),
                 ("right", "Walk right", pygame.K_d), ("sprint", "Sprint (hold)", pygame.K_LSHIFT), ("jump", "Jump", pygame.K_SPACE)]),
     ("ABILITY PERKS", 0, [("abil1", "Ability 1", pygame.K_q), ("abil2", "Ability 2", pygame.K_r)]),
+    ("YOUR ORB", 1, [("orbshot", "Orb shot (hold)", pygame.K_c), ("dash", "Dash", pygame.K_LCTRL)]),
     ("PEOPLE", 0, [("talk", "Talk to someone", pygame.K_z), ("chat", "Chat", pygame.K_RETURN)]),
     ("TOWERS", 1, [("slot1", "Pick tower 1", pygame.K_1), ("slot2", "Pick tower 2", pygame.K_2), ("slot3", "Pick tower 3", pygame.K_3),
                    ("slot4", "Pick tower 4", pygame.K_4), ("slot5", "Pick tower 5", pygame.K_5), ("slot6", "Pick tower 6", pygame.K_6),
@@ -590,11 +592,14 @@ DEFAULT_SAVE = {
     "titles": ["rookie"], "title": "rookie",
     "seen": [],                                              # videos watched, tips shown
     "stars": {},        # "map:difficulty" -> best stars
-    "best": {},         # "map:difficulty" -> best wave reached
+    "best": {},         # "map:difficulty" -> best wave reached ("map:endless" for endless runs)
+    "bf": {},           # the Blood Factory event: met (talked to the shadow), yes (agreed to help), obby (best checkpoint), done
+    "daily": {},        # the daily challenge: date, best wave today, plays, streak, last day it was paid, best ever
     "stats": {"kills": 0, "games": 0, "wins": 0, "towers": 0, "bosses": 0, "mpwins": 0, "talks": 0},
     "upd_code": "",     # the update code this PC shares with your other PC ("" = updates over Wi-Fi are off)
     "upd_ip": "",       # the other PC's address, if you typed it in
     "upd_last": "",     # where the other PC was the last time it answered
+    "mymaps": [],       # maps you drew (see custom_clean)
     "keys": {},         # action -> key (pygame key code), see KEY_GROUPS.  Anything missing gets its default.
 }
 OLD_DIFF = {"easy": "normal", "normal": "hard", "hard": "insane"}
@@ -942,6 +947,318 @@ def rich_wrap(txt, size, width):
     return out
 
 
+# ---------------------------------------------------------------- how a chat line FEELS (from its punctuation)
+MOODS = {
+    "calm": dict(verb="", tint=(255, 255, 255), mix=0.0, speed=44),
+    "angry": dict(verb="SHOUTS", tint=(255, 70, 60), mix=0.85, speed=85, shake=1.7, fat=True),
+    "excited": dict(verb="CHEERS", tint=(255, 200, 60), mix=0.7, speed=72, bob=4.0, bf=10.0, bp=0.55),
+    "surprised": dict(verb="GASPS", tint=(255, 240, 90), mix=0.75, speed=400, hop=11.0, shake=0.7),
+    "worried": dict(verb="WORRIES", tint=(160, 200, 255), mix=0.6, speed=26, tremble=1.1),
+    "sad": dict(verb="SIGHS", tint=(110, 135, 205), mix=0.7, speed=19, droop=0.22, sway=1.2),
+    "confused": dict(verb="WONDERS", tint=(200, 150, 255), mix=0.7, speed=34, wamp=3.0, wf=5.0, wp=0.9, xamp=1.2),
+    "curious": dict(verb="ASKS", tint=(120, 225, 255), mix=0.55, speed=44, wamp=1.8, wf=4.0, wp=-0.45),
+    "happy": dict(verb="SMILES", tint=(150, 255, 175), mix=0.6, speed=52, wamp=2.0, wf=6.0, wp=0.6),
+    "love": dict(verb="SWOONS", tint=(255, 130, 190), mix=0.75, speed=40, wamp=2.4, wf=5.0, wp=0.5),
+    "laugh": dict(verb="LAUGHS", tint=(190, 255, 110), mix=0.7, speed=70, bob=5.0, bf=14.0, bp=0.9, shake=0.5),
+    "playful": dict(verb="TEASES", tint=(255, 160, 120), mix=0.65, speed=44, wamp=2.0, wf=5.0, wp=0.5, xamp=2.0),
+    "bored": dict(verb="MUMBLES", tint=(150, 150, 168), mix=0.7, speed=23),
+}
+_MOOD_RULES = (
+    ("love", re.compile(r"<3")),
+    ("laugh", re.compile(r"(?:^|\s)[xX][dD](?:\s|[!.?]|$)|:\s?D\b|:'D")),
+    ("angry", re.compile(r">:\(|>:-\(|D:<|>_<")),
+    ("sad", re.compile(r":'?\(|;_;|;\(|T_T|t_t|:\[")),
+    ("surprised", re.compile(r":-?[oO](?:\s|$)|(?:^|\s)[oO]_[oO](?:\s|$)|:-?0(?:\s|$)")),
+    ("bored", re.compile(r"-_-|(?:^|\s)-\.-")),
+    ("happy", re.compile(r":-?\)|=\)|\^_?\^|:3|:-?\]|\(:")),
+)
+
+
+def chat_mood(text):
+    """what the punctuation says about how this was said -> a key of MOODS.  Only the punctuation and the capitals count,
+    so it comes out the same on every computer."""
+    try:
+        t = "".join(bit for bit, marked in rich_parts(text) if not marked).strip()
+    except Exception:
+        t = str(text).strip()
+    if not t:
+        return "calm"
+    for key, rx in _MOOD_RULES:
+        if rx.search(t):
+            return key
+    letters = [c for c in t if c.isalpha()]
+    caps = len(letters) >= 4 and sum(1 for c in letters if c.isupper()) >= 0.8 * len(letters)
+    ex, qs = t.count("!"), t.count("?")
+    if re.search(r"\?+!+|!+\?+", t):
+        return "surprised"                              # ?!  !?  ?!?
+    if caps or ex >= 4:
+        return "angry"                                  # SHOUTING, or a pile of !!!!
+    if "..." in t and qs:
+        return "worried"                                # um... are we ok?
+    if re.search(r"\?\s*\.{2,}$|\.{2,}\s*\?$", t):
+        return "worried"
+    if re.search(r"(?:\.{2,}|…)$", t):
+        return "sad"                                    # trailing off...
+    if qs >= 2:
+        return "confused"                               # ??  ???
+    if ex >= 2:
+        return "excited"                                # !!  !!!
+    if ex == 1:
+        return "happy"
+    if qs == 1:
+        return "curious"
+    if t.endswith("~"):
+        return "playful"
+    return "calm"
+
+
+def mood_off(M, i, t, age):
+    """how far letter number i of a chat line is moved (dx, dy) in this mood, at time t, age seconds after it appeared"""
+    dx = dy = 0.0
+    sh = M.get("shake")
+    if sh:
+        h = (i * 7919 + int(t * 30) * 104729) & 0xFFFF
+        dx += ((h % 97) / 48.0 - 1.0) * sh
+        dy += (((h // 97) % 97) / 48.0 - 1.0) * sh
+    if M.get("bob"):
+        dy -= abs(math.sin(t * M["bf"] + i * M["bp"])) * M["bob"]
+    if M.get("wamp"):
+        dy += math.sin(t * M["wf"] + i * M["wp"]) * M["wamp"]
+        dx += math.sin(t * M["wf"] * 0.6 + i * M["wp"]) * M.get("xamp", 0.0)
+    if M.get("tremble"):
+        dx += math.sin(t * 38 + i * 1.7) * M["tremble"]
+    if M.get("droop"):
+        dy += min(i * M["droop"], 6.0) + math.sin(t * 1.5 + i * 0.3) * M.get("sway", 0.0)
+    if M.get("hop") and age < 0.5:
+        dy -= math.sin(age / 0.5 * math.pi) * M["hop"]
+    return dx, dy
+
+
+_glyphs = {}
+_pre_w = {}
+
+
+def draw_mood(s, txt, size, col, x, y, k, mood, t, age, i0=0):
+    """draw_rich() for a line with a mood: every letter moves its own way.  -> where it ends"""
+    M = MOODS.get(mood) or MOODS["calm"]
+    tint = scale_col(mix_col(col, M["tint"], M["mix"]), k)
+    f = font(size)
+    x = int(x)
+    i = i0
+    for bit, marked in rich_parts(txt):
+        if marked:
+            dx, dy = mood_off(M, i, t, age)
+            x = draw_rich(s, CEN_A + bit + CEN_A, size, col, x + int(dx), y + dy, k) - int(dx)
+            i += 1
+            continue
+        pk = (bit, size)
+        pw = _pre_w.get(pk)
+        if pw is None:
+            if len(_pre_w) > 400:
+                _pre_w.clear()
+            pw = _pre_w[pk] = [f.size(bit[:j])[0] for j in range(len(bit) + 1)]
+        for j, ch in enumerate(bit):
+            if ch != " ":
+                gk = (ch, size, tint, M.get("fat", False))
+                g = _glyphs.get(gk)
+                if g is None:
+                    if len(_glyphs) > 900:
+                        _glyphs.clear()
+                    g = f.render(ch, True, tint)
+                    if M.get("fat"):
+                        g2 = pygame.Surface((g.get_width() + 1, g.get_height()), pygame.SRCALPHA)
+                        g2.blit(g, (0, 0))
+                        g2.blit(g, (1, 0))
+                        g = g2
+                    _glyphs[gk] = g
+                dx, dy = mood_off(M, i + j, t, age)
+                s.blit(g, (x + pw[j] + int(dx), int(y + dy) - g.get_height() // 2))
+        x += pw[-1]
+        i += len(bit)
+    return x
+
+
+# ---------------------------------------------------------------- particles around a chat box, one look per mood
+def _pr(seed, n):
+    """a steady pseudo-random number 0..1 for particle n of a chat line"""
+    h = (seed * 73856093 ^ n * 19349663 ^ 0x5bd1e995) & 0xFFFFFFFF
+    h = (h ^ (h >> 13)) * 1274126177 & 0xFFFFFFFF
+    return ((h ^ (h >> 16)) & 0xFFFF) / 65535.0
+
+
+def _heart(s, x, y, r, c):
+    if max(c) < 90:
+        return
+    pygame.draw.circle(s, c, (int(x - r * 0.5), int(y - r * 0.3)), max(1, int(r * 0.55)))
+    pygame.draw.circle(s, c, (int(x + r * 0.5), int(y - r * 0.3)), max(1, int(r * 0.55)))
+    pygame.draw.polygon(s, c, [(x - r * 1.02, y - r * 0.1), (x + r * 1.02, y - r * 0.1), (x, y + r * 1.1)])
+
+
+def _spark(s, x, y, r, c, k):
+    if k < 0.25:
+        return
+    r *= 1.7
+    glow(s, x, y, r * 3.2, c, 0.8 * k)
+    pygame.draw.polygon(s, scale_col(mix_col(c, WHITE, 0.6), k), star_pts(x, y, r, 4, 0.0, 0.3))
+
+
+def draw_mood_fx(s, mood, r, t, age, k, seed):
+    """sparks, confetti, tears, hearts...: a little show round a chat box.  Nothing is stored: where a particle is comes from the time."""
+    M = MOODS.get(mood)
+    if not M or mood == "calm" or k < 0.05:
+        return
+    tint = M["tint"]
+    x0, y0, w, h = r.x, r.y, r.w, r.h
+    ft = font(14)
+    if mood == "angry":
+        for i in range(26):                                   # sparks flying off the top, hot to dark
+            ph = (t * 1.5 + _pr(seed, i)) % 1.0
+            x = x0 + 24 + _pr(seed, i + 40) * (w - 48) + math.sin(ph * 9 + i) * 8
+            y = y0 + 6 - ph * 46
+            c = mix_col((255, 220, 90), (255, 40, 30), ph)
+            glow(s, x, y, 14 * (1 - ph) + 5, c, 1.0 * k * (1 - ph))
+            pygame.draw.circle(s, scale_col(c, k * (1 - ph * 0.6)), (int(x), int(y)), max(2, int(5 * (1 - ph))))
+        for i in range(3):                                    # steam puffs from the corners
+            for side in (0, 1):
+                ph = (t * 0.8 + i / 3.0 + side * 0.4) % 1.0
+                x = (x0 + 6 if side == 0 else x0 + w - 6) + math.sin(ph * 6 + side * 2) * 6
+                y = y0 - 2 - ph * 30
+                glow(s, x, y, 14 + ph * 16, (230, 90, 60), 0.6 * k * (1 - ph))
+        if age < 0.5:                                         # a red flash when it pops up
+            glow(s, x0 + w / 2, y0 + h / 2, w * 0.55, (255, 40, 30), 0.5 * k * (1 - age / 0.5))
+    elif mood == "excited":
+        cols = ((255, 90, 120), (255, 210, 60), (90, 220, 255), (150, 255, 120), (230, 120, 255))
+        for i in range(26):                                   # confetti
+            ph = (t * 0.7 + _pr(seed, i)) % 1.0
+            x = x0 + _pr(seed, i + 30) * w + math.sin(ph * 12 + i) * 9
+            y = y0 - 26 + ph * (h + 44)
+            if ph > 0.9:
+                continue
+            c = scale_col(cols[i % 5], k * min(1.0, (1 - ph) * 3))
+            a = t * 6 + i
+            pts = [(x + math.cos(a) * 4, y + math.sin(a) * 2), (x - math.cos(a) * 4, y - math.sin(a) * 2),
+                   (x - math.cos(a) * 4 + 2, y - math.sin(a) * 2 + 3), (x + math.cos(a) * 4 + 2, y + math.sin(a) * 2 + 3)]
+            pygame.draw.polygon(s, c, [(px + (px - x) * 0.5, py + (py - y) * 0.5) for px, py in pts])
+        for i in range(4):
+            ph = (t * 1.3 + i * 0.25) % 1.0
+            _spark(s, x0 + w * (0.12 + 0.25 * i) + math.sin(t * 3 + i) * 10, y0 - 6 - math.sin(ph * math.pi) * 14, 5, (255, 220, 90), k * math.sin(ph * math.pi))
+    elif mood == "surprised":
+        if age < 0.9:                                         # a burst from the portrait: rings and lines
+            f = age / 0.9
+            cx, cy = x0 + 26, y0 + 27
+            for q in range(2):
+                rr = (f * 70 + q * 14)
+                if rr > 0:
+                    pygame.draw.circle(s, scale_col(tint, k * (1 - f)), (cx, cy), int(rr), 2)
+            for i in range(14):
+                a = i * TAU / 14 + _pr(seed, i) * 0.3
+                r1, r2 = 20 + f * 30, 34 + f * 70
+                pygame.draw.line(s, scale_col((255, 255, 160), k * (1 - f)), (cx + math.cos(a) * r1, cy + math.sin(a) * r1),
+                                 (cx + math.cos(a) * r2, cy + math.sin(a) * r2), 2)
+        for i in range(3):                                    # "!" popping up and out
+            ph = (t * 1.1 + i / 3.0) % 1.0
+            x = x0 + w - 18 - i * 20 + math.sin(i * 3) * 4
+            y = y0 - 4 - ph * 26
+            if ph > 0.75:
+                continue
+            sf = font_b(28).render("!", True, scale_col((255, 240, 90), k * (1 - ph)))
+            s.blit(sf, (x - sf.get_width() / 2, y - sf.get_height() / 2))
+    elif mood == "worried":
+        for i in range(8):                                    # sweat drops sliding off
+            ph = (t * 0.55 + _pr(seed, i)) % 1.0
+            x = x0 + 14 + _pr(seed, i + 9) * (w - 28)
+            y = y0 - 6 + ph * (h * 0.7)
+            c = scale_col((170, 215, 255), k * (1 - ph * 0.7))
+            pygame.draw.circle(s, c, (int(x), int(y + 4)), 5)
+            pygame.draw.polygon(s, c, [(x - 4, y + 2), (x + 4, y + 2), (x, y - 8)])
+        for i in range(4):                                    # a nervous shiver of dots around the edge
+            a = t * 9 + i * 1.6
+            glow(s, x0 + (w * (0.2 + 0.2 * i)), y0 + h + 3 + math.sin(a) * 2, 8, (130, 170, 255), 0.3 * k)
+    elif mood == "sad":
+        cx = x0 + w * 0.5
+        for i in range(4):                                    # a little grey rain cloud
+            glow(s, x0 + w * (0.2 + 0.14 * i), y0 - 8 + math.sin(t + i) * 2, 24, (130, 145, 210), 0.8 * k)
+        for i in range(28):                                   # rain
+            ph = (t * 0.9 + _pr(seed, i)) % 1.0
+            x = x0 + 14 + _pr(seed, i + 50) * (w - 28)
+            y = y0 - 4 + ph * (h + 10)
+            pygame.draw.line(s, scale_col((140, 175, 255), k * (1 - ph * 0.6)), (x, y), (x - 2, y + 11), 2)
+        for i in range(2):                                    # tears from the portrait
+            ph = (t * 0.45 + i * 0.5) % 1.0
+            x = x0 + 30 + i * 4
+            y = y0 + 34 + ph * 26
+            pygame.draw.circle(s, scale_col((150, 190, 255), k * (1 - ph)), (int(x), int(y)), 3)
+    elif mood == "confused":
+        for i in range(3):                                    # question marks circling the portrait
+            a = t * 2.2 + i * TAU / 3
+            x, y = x0 + 26 + math.cos(a) * 24, y0 + 20 + math.sin(a) * 9 - 10
+            sf = font_b(26).render("?", True, scale_col((205, 150, 255), k))
+            s.blit(sf, (x - sf.get_width() / 2, y - sf.get_height() / 2))
+        for i in range(10):                                   # dizzy spiral dots
+            ph = (t * 0.6 + i / 10.0) % 1.0
+            a = ph * TAU * 2 + i
+            rr = 6 + ph * 22
+            glow(s, x0 + w - 30 + math.cos(a) * rr, y0 + h / 2 + math.sin(a) * rr * 0.6, 8, (190, 130, 255), 0.55 * k * (1 - ph))
+    elif mood == "curious":
+        for i in range(4):                                    # "?" drifting up, with sparkles
+            ph = (t * 0.6 + i / 4.0) % 1.0
+            x = x0 + w * (0.15 + 0.22 * i) + math.sin(ph * 7 + i) * 6
+            y = y0 - 2 - ph * 34
+            if math.sin(ph * math.pi) < 0.3:
+                continue
+            sf = font_b(26).render("?", True, scale_col((120, 225, 255), k * math.sin(ph * math.pi)))
+            s.blit(sf, (x - sf.get_width() / 2, y - sf.get_height() / 2))
+        for i in range(5):
+            ph = (t * 0.9 + _pr(seed, i)) % 1.0
+            _spark(s, x0 + _pr(seed, i + 9) * w, y0 + _pr(seed, i + 19) * h, 3 + 2 * math.sin(ph * math.pi), (150, 235, 255), k * math.sin(ph * math.pi))
+    elif mood == "happy":
+        for i in range(10):                                   # twinkles
+            ph = (t * 0.8 + _pr(seed, i)) % 1.0
+            _spark(s, x0 + _pr(seed, i + 9) * w, y0 - 8 + _pr(seed, i + 19) * (h + 14), 2.5 + 3 * math.sin(ph * math.pi), (190, 255, 200), k * math.sin(ph * math.pi))
+        for i in range(2):                                    # a happy glow from the corner
+            glow(s, x0 + w - 10 - i * 30, y0 + 6, 26, (120, 255, 160), 0.22 * k * (0.7 + 0.3 * math.sin(t * 3 + i)))
+    elif mood == "love":
+        for i in range(12):                                   # hearts rising
+            ph = (t * 0.55 + _pr(seed, i)) % 1.0
+            x = x0 + 20 + _pr(seed, i + 7) * (w - 40) + math.sin(ph * 8 + i) * 7
+            y = y0 + h - ph * (h + 40)
+            c = scale_col(mix_col((255, 90, 150), (255, 200, 225), _pr(seed, i + 3)), k * min(1.0, (1 - ph) * 2.5))
+            _heart(s, x, y, 6 + 4 * _pr(seed, i + 15), c)
+        glow(s, x0 + 26, y0 + 27, 34 + 5 * math.sin(t * 5), (255, 110, 170), 0.35 * k)
+    elif mood == "laugh":
+        for i in range(8):                                    # joy tears flying out, stars bouncing
+            ph = (t * 1.2 + _pr(seed, i)) % 1.0
+            sd = -1 if i % 2 else 1
+            x = x0 + 26 + sd * (10 + ph * 40) + (w - 52 if sd > 0 else 0) * 0
+            y = y0 + 20 - math.sin(ph * math.pi) * 22 + ph * ph * 30
+            pygame.draw.circle(s, scale_col((170, 225, 255), k * (1 - ph)), (int(x), int(y)), 3)
+        for i in range(6):
+            ph = (t * 1.6 + i / 6.0) % 1.0
+            _spark(s, x0 + w * (0.1 + 0.16 * i), y0 - 4 - abs(math.sin(ph * math.pi * 2)) * 14, 4, (200, 255, 120), k)
+        sf = font_b(15).render("HA", True, scale_col((200, 255, 120), k * (0.5 + 0.5 * math.sin(t * 12))))
+        s.blit(sf, (x0 + w - 28 + math.sin(t * 20) * 2, y0 - 8 - abs(math.sin(t * 6)) * 6))
+    elif mood == "playful":
+        for i in range(9):                                    # bubbles zig-zagging, with stars
+            ph = (t * 0.5 + _pr(seed, i)) % 1.0
+            x = x0 + _pr(seed, i + 5) * w + math.sin(ph * 14 + i) * 10
+            y = y0 + h - ph * (h + 36)
+            rr = 5 + 6 * _pr(seed, i + 11)
+            c = scale_col(mix_col((255, 160, 120), (255, 120, 220), _pr(seed, i + 1)), k * (1 - ph * 0.6))
+            pygame.draw.circle(s, c, (int(x), int(y)), int(rr), 1)
+            pygame.draw.circle(s, scale_col(WHITE, k * 0.7), (int(x - rr * 0.3), int(y - rr * 0.3)), 1)
+        for i in range(3):
+            _spark(s, x0 + w * (0.2 + 0.3 * i), y0 - 5 + math.sin(t * 4 + i * 2) * 4, 4, (255, 190, 120), k)
+    elif mood == "bored":
+        for i in range(3):                                    # "z z z" drifting up, a dull haze
+            ph = (t * 0.35 + i / 3.0) % 1.0
+            if math.sin(ph * math.pi) < 0.3:
+                continue
+            sf = font_b(20 + i * 6).render("z", True, scale_col((160, 160, 185), k * math.sin(ph * math.pi)))
+            s.blit(sf, (x0 + w - 24 + ph * 18 - i * 2, y0 + 4 - ph * 36))
+        for i in range(4):
+            glow(s, x0 + w * (0.2 + 0.2 * i), y0 + h + 2, 12, (110, 110, 135), 0.25 * k)
+
+
 def draw_rich(s, txt, size, col, x, y, k=1.0):
     """draw a chat line from (x, y) to the right.  Blocked words are bold, bright red, on a dark red box.  -> where it ends"""
     x = int(x)
@@ -1111,7 +1428,7 @@ TOWERS = {
                          dict(cost=5200, dmg=255, cd=0.70, rng=145, chain=8))),
     "summoner": dict(lore="It never leaves the core. Its goons never come back to it.",
                      name="SUMMONER", col=(255, 196, 110), place="G", atk="SUMMON", tier="MID", need=11, price=1500, aoe=False,
-                     desc="Does not shoot. Sends goons out of your core, up the road. A goon and an enemy that meet trade health: the weaker one is destroyed.",
+                     desc="Does not shoot. Sends goons out of your core, up the road. A goon and an enemy that meet trade health: the weaker one is destroyed. You can have 1. Level up to unlock shield, archer and healer goons (press T). At max level it can send the KING OF THE GOONS for cash.",
                      # ghp = goon health, cd = seconds between goons, cap = goons alive at once (per tower), gspd = how fast they walk
                      # (balanced with bal_summon.py: about as good for its price as a gun tower early on, a little behind at the top)
                      lv=_lv(dict(cost=450, ghp=60, cd=4.8, cap=3, gspd=48, rng=0),
@@ -1232,6 +1549,15 @@ TOWERS = {
                          dict(cost=1300, hp=9000, block=4, boom=500),
                          dict(cost=2800, hp=16000),
                          dict(cost=5500, hp=30000, block=5, boom=1500, brad=90))),
+    "chainsaw": dict(lore="Desolation built it to cut things. It has been waiting for someone kinder.",
+                     name="CHAINSAW", col=(255, 72, 64), place="G", atk="SUMMON", tier="EVENT", need=1, price=0, aoe=False, event="blood",
+                     desc="Sends SAWS up the road. A saw rips through everything it touches, but every enemy it kills wears the blade down. You can have 2. Every level makes saws hit harder and last longer.",
+                     # shp = saw health, sdmg = damage per cut (4 cuts a second), cd = seconds between saws, cap = saws alive at once, gspd = speed
+                     lv=_lv(dict(cost=1800, shp=420, sdmg=26, cd=7.0, cap=2, gspd=64, rng=0),
+                            dict(cost=1300, shp=820, sdmg=48, cd=6.5, cap=3, gspd=68),
+                            dict(cost=2400, shp=1500, sdmg=90, cd=6.0, gspd=72),
+                            dict(cost=4600, shp=2800, sdmg=170, cd=5.4, cap=4, gspd=76),
+                            dict(cost=9000, shp=5200, sdmg=330, cd=4.6, cap=5, gspd=82))),
 }
 TOWER_ORDER = list(TOWERS)
 SHOP_TOWERS = [k for k in TOWER_ORDER if not TOWERS[k].get("event")]
@@ -1241,14 +1567,48 @@ PLACE_NAME = {"G": "GROUND", "C": "CLIFF", "B": "GROUND + CLIFF", "P": "ON THE R
 PLACE_SHORT = {"G": "GROUND", "C": "CLIFF", "B": "ANY", "P": "ROAD"}
 PLACE_COL = {"G": GREY, "C": GOLD, "B": MINT, "P": (120, 200, 255)}
 TARGET_MODES = ["FIRST", "LAST", "STRONG", "CLOSE"]
+SQUADS = ["SOLDIERS", "SHIELDS", "ARCHERS", "HEALERS", "SQUAD"]       # what a Summoner sends out (it unlocks one more with every level)
+SQUAD_MIX = [0, 1, 2, 0, 3]                                          # the SQUAD: soldier, shield, archer, soldier, healer
+GOON_ROLE_HP = (1.0, 2.2, 0.55, 0.6, 1.0)
+GOON_ROLE_SPD = (1.0, 0.8, 1.0, 1.0, 1.0)
+ARCHER_RNG = 100.0
+ARCHER_EVERY = 0.9
+HEAL_RNG = 70.0
+GOON_ROLE_COL = ((255, 210, 90), (90, 220, 255), (255, 170, 60), (90, 255, 140), (255, 90, 80))
 HARVESTER_MAX = 4
-SUMMONER_MAX = 4            # Summoners per player (4 at top level are 24 goons on the road)
+CHAINSAW_MAX = 2
+SAW_TICK = 0.25              # a saw cuts four times a second
+SAW_WEAR = 0.30              # a saw loses this much health for every point of damage it deals...
+SAW_WEAR_BOSS = 0.07         # ...(much less against a boss, or nothing would ever finish one)
+SAW_KILL_WEAR = 0.035        # ...and this much of its health for every enemy it kills
+SUMMONER_MAX = 1            # one Summoner per player (four top-level ones carried whole runs)
+KING_LV = 5                 # a goon with this level is the King of the Goons
+KING_HP = 12000             # his health (a normal goon tops out at 920)
+KING_SPD = 40               # he walks slowly, like he owns the road
+KING_R = 15.0               # and he is big
+KING_SC = 1.9               # how much bigger he is drawn
+KING_PRICE = 20000          # the first King costs this much cash...
+KING_STEP = 10000           # ...and every King after it costs this much more
+KING_WAIT = 60.0            # seconds before the Summoner can send another
+
+# ---- VERSUS: every player has their own copy of the map. Cash buys enemies that walk down the NEXT player's road.
+# (name, enemy, how many, base price, seconds between them, from which wave of the sender)
+VS_SENDS = [("SWARM", "swarm", 12, 90, 0.14, 2), ("RUNNERS", "runner", 6, 130, 0.30, 2), ("TANKS", "tank", 3, 260, 0.9, 4),
+            ("SHIELDERS", "shield", 5, 300, 0.55, 6), ("ELITE", "elite", 1, 480, 1.0, 10), ("JUGGERNAUT", "jugger", 1, 900, 1.0, 16)]
+VS_GROW = 0.10              # prices go up this much for every wave the sender has reached
+VS_INCOME = 0.08            # every cash spent on sending also pays back this much more at the end of each wave
+VS_QUEUE = 80               # most enemies that can be waiting to walk in
+VS_WAVES = 100              # nobody ever "finishes" a versus match: you win when the other cores fall
+
+
+def vs_cost(wave, i):
+    return int(round(VS_SENDS[i][3] * (1 + VS_GROW * max(0, wave)) / 5.0)) * 5
 STONKS_MAX = 2
 PATH_MAX = 4                # path towers per player
 DEFAULT_MODE = {"prism": 2}      # starts on STRONG
 CLIFF_RANGE = 0.10          # every tower on a cliff sees this much further
 SUPPORT_KINDS = ("beacon", "commander", "mechanic")
-NOFIGHT = ("beacon", "commander", "mechanic", "harvester", "stonks", "summoner")     # towers that never aim or shoot themselves
+NOFIGHT = ("beacon", "commander", "mechanic", "harvester", "stonks", "summoner", "chainsaw")     # towers that never aim or shoot themselves
 PAINTS = [None, CYAN, PINK, GOLD, GREEN, PURPLE, ORANGE, BLUE, MINT, RED, MAGENTA, YELLOW, WHITE, (255, 120, 90), (120, 255, 90), (90, 110, 255)]
 PAINT_NAMES = ["FACTORY", "CYAN", "PINK", "GOLD", "LIME", "VIOLET", "ORANGE", "SKY", "MINT", "RED", "MAGENTA", "SUN", "WHITE", "CORAL", "ACID", "COBALT"]
 
@@ -1279,7 +1639,13 @@ def tower_stats(kind, L):
     if kind in ("harvester", "stonks"):
         return [("CASH / WAVE", "+%d" % L["income"] if kind == "harvester" else "~%d" % L["income"])]
     if kind == "summoner":
-        return [("GOON HEALTH", "%d" % L["ghp"]), ("NEW GOON", "every %.1fs" % L["cd"]), ("GOONS AT ONCE", "%d" % L["cap"]), ("GOON SPEED", "%d" % L["gspd"])]
+        out = [("GOON HEALTH", "%d" % L["ghp"]), ("NEW GOON", "every %.1fs" % L["cd"]), ("GOONS AT ONCE", "%d" % L["cap"]), ("GOON SPEED", "%d" % L["gspd"])]
+        if L["ghp"] >= 900:
+            out.append(("KING OF THE GOONS", "%dk cash" % (KING_PRICE // 1000)))
+        return out
+    if kind == "chainsaw":
+        return [("SAW HEALTH", "%d" % L["shp"]), ("SAW DAMAGE", "%d / s" % int(L["sdmg"] / SAW_TICK)), ("NEW SAW", "every %.1fs" % L["cd"]),
+                ("SAWS AT ONCE", "%d" % L["cap"]), ("SAW SPEED", "%d" % L["gspd"])]
     if kind == "beacon":
         out = [("RANGE BOOST", "+%d%%" % round(L["rbuff"] * 100)), ("FIELD", "%d" % L["rng"])]
         if L.get("reveal"):
@@ -1431,7 +1797,8 @@ for _k, _p in TPERKS.items():
 # ---------------------------------------------------------------- cards (pick 1 of 3 every 5 waves)
 MODS0 = dict(dmg=0.0, rate=0.0, rng=0.0, cliffrng=0.0, crit=0.0, bossdmg=0.0, finisher=0.0, burn=0.0, splash=0.0, melee=0.0, aura=0.0,
              pathhp=0.0, corehp=0, aegis=0, gravity=0.0, harden=0.0, regen=0,
-             bounty=0.0, discount=0.0, recycle=0.0, charge=0.0, startcash=0, cash=0)
+             bounty=0.0, discount=0.0, recycle=0.0, charge=0.0, startcash=0, cash=0,
+             orbdmg=0.0, orbrate=0.0, orbpierce=0, dashcd=0.0, dashkb=0.0)
 GLOBAL_MODS = ("corehp", "aegis", "gravity", "regen")
 CARDS = [
     ("ATTACK", "OVERDRIVE", "dmg", (.06, .10, .15), "Your towers deal +{p}% damage"),
@@ -1453,6 +1820,22 @@ CARDS = [
     ("SUPPORT", "RECYCLER", "recycle", (.10, .15, .25), "Selling refunds {p}% more"),
     ("SUPPORT", "QUICK CHARGE", "charge", (.12, .18, .25), "Abilities recharge {p}% faster"),
 ]
+# cards for your ORB (only in real matches: they join the ATTACK and SUPPORT piles)
+ORB_CARDS = [
+    ("ATTACK", "ORB: SHARP SHOTS", "orbdmg", (.30, .55, .90), "Your orb's shots deal +{p}% damage"),
+    ("ATTACK", "ORB: RAPID FIRE", "orbrate", (.12, .20, .30), "Your orb shoots {p}% faster"),
+    ("ATTACK", "ORB: PIERCING", "orbpierce", (1, 2, 3), "Orb shots go through {v} more enemies"),
+    ("SUPPORT", "ORB: QUICK DASH", "dashcd", (.15, .25, .40), "Your dash recharges {p}% faster"),
+    ("SUPPORT", "ORB: HEAVY SHOVE", "dashkb", (.30, .60, 1.00), "Your dash shoves enemies {p}% further"),
+]
+ORB_CD = 0.34           # seconds between orb shots
+ORB_SPD = 780.0
+ORB_RANGE = 440.0
+ORB_DMG = 7.0           # times the enemy health scale of this wave
+DASH_CD = 5.0
+DASH_DIST = 120.0
+DASH_TIME = 0.2
+DASH_PUSH = 85.0        # how far a dash shoves an enemy back down its road
 RARITY = [("COMMON", GREY), ("RARE", CYAN), ("EPIC", GOLD)]
 CARD_EVERY = 5
 
@@ -1479,6 +1862,17 @@ ENEMIES = {
                   info="EMP pulses switch your towers off. Fortifies when hurt."),
     "architect": dict(name="THE ARCHITECT", hp=3000, spd=23, r=32, col=CYAN, leak=20, armor=4, boss=True,
                       info="Final boss. Hacks towers, blinks forward and goes into overdrive."),
+    # a rare red horror: 1 wave in 5 may bring one.  Somebody is collecting them.
+    "bloodlust": dict(name="BLOODLUST", hp=230, spd=64, r=12, col=(225, 24, 48), leak=8, info="A rare red horror. It goes into a frenzy now and then."),
+    # the Blood Factory bosses
+    "desolation": dict(name="DESOLATION", hp=1500, spd=40, r=34, col=(235, 36, 52), leak=20, armor=3, boss=True, ai="desolation", model="desolation",
+                       info="Chainsaw hands. Stuns and destroys towers from afar."),
+    "scarecrow": dict(name="THE GIANT SCARECROW", hp=1000, spd=0, r=58, col=(228, 168, 58), leak=0, armor=0, boss=True, ai="scarecrow", model="scarecrow",
+                      info="It cannot fight. It just stands there and calls stars."),
+    # flyers: they follow the road like everybody else, but high up.  Towers that only hit the ground cannot touch them.
+    "drone": dict(name="DRONE", hp=20, spd=72, r=8, col=(120, 230, 255), leak=2, air=True, info="Follows the road in the sky. Ground-only towers can't hit it."),
+    "gunship": dict(name="GUNSHIP", hp=105, spd=44, r=13, col=(255, 150, 90), leak=5, armor=1, air=True, info="A flying tank. Needs towers that shoot up."),
+    "zeppelin": dict(name="ZEPPELIN", hp=450, spd=30, r=19, col=(190, 140, 255), leak=10, armor=3, air=True, info="Slow, huge and in the sky. Bring anti-air."),
     # event bosses borrow a brain (ai) and a body (model) and dress up
     "pumpking": dict(name="THE PUMPKIN KING", hp=2300, spd=21, r=34, col=(255, 128, 22), leak=20, armor=4, boss=True, ai="titan", model="titan",
                      info="Halloween boss. EMP pulses and a very large hat."),
@@ -1501,7 +1895,16 @@ WAVE_UNITS = {
     "shield": (6, 13, 2, 0.8), "splitter": (8, 15, 2, 0.9), "healer": (11, 17, 1, 1.7), "elite": (12, 55, 1, 3.0),
     "blinker": (13, 12, 2, 0.7), "phantom": (15, 13, 2, 0.7), "jugger": (18, 90, 1, 4.0),
 }
-ENEMY_ORDER = ["grunt", "runner", "swarm", "tank", "shield", "splitter", "healer", "elite", "blinker", "phantom", "jugger",
+# flyers (only in real matches, see World.air_on): kind: (first wave, cost, weight, seconds between spawns)
+AIR_UNITS = {"drone": (5, 7, 2, 0.5), "gunship": (10, 26, 1, 1.4), "zeppelin": (16, 85, 1, 3.5)}
+GROUND_ONLY = ("blade", "cat", "mortar", "toaster", "pumpkin", "graviton")      # towers that cannot hit flyers (path towers and goons cannot either)
+for _k in GROUND_ONLY:
+    TOWERS[_k]["desc"] += " Cannot hit flyers."
+for _k, _T in TOWERS.items():
+    if _T["atk"] == "PATH":
+        _T["desc"] += " Flyers go over it."
+AIR_H = 34.0                 # how high flyers are drawn above the ground
+ENEMY_ORDER = ["grunt", "runner", "swarm", "tank", "shield", "splitter", "healer", "elite", "blinker", "phantom", "jugger", "drone", "gunship", "zeppelin",
                "overseer", "queen", "titan", "architect"]
 
 # ---------------------------------------------------------------- difficulty + balance knobs
@@ -1509,9 +1912,64 @@ DIFFS = {
     "normal": dict(name="NORMAL", waves=20, hp=0.78, hpw=0.008, spd=1.0, cash=650, core=100, early=0, coins=300, per=5, xp=8, xpwin=120, first=150, boss=25000, col=GREEN),
     "hard": dict(name="HARD", waves=30, hp=0.95, hpw=0.04, spd=1.0, cash=600, core=100, early=0, coins=600, per=8, xp=12, xpwin=250, first=300, boss=50000, col=GOLD),
     "insane": dict(name="INSANE", waves=30, hp=1.0, hpw=0.07, spd=1.08, cash=700, core=60, early=2, coins=1000, per=12, xp=16, xpwin=400, first=600, boss=100000, col=RED),
+    "endless": dict(name="ENDLESS", waves=999, hp=0.95, hpw=0.04, spd=1.0, cash=600, core=100, early=0, coins=0, per=5, xp=7, xpwin=0, first=0, boss=50000, col=CYAN),
     "event": dict(name="EVENT", waves=25, hp=0.95, hpw=0.0, spd=1.0, cash=650, core=100, early=1, coins=800, per=8, xp=14, xpwin=350, first=0, boss=40000, col=MAGENTA),
 }
 DIFF_ORDER = ["normal", "hard", "insane"]
+DAILY_MIN = 5                # waves to reach in the daily challenge for its bonus
+BLOODLUST_CHANCE = 0.2       # the chance that a wave brings a Bloodlust (until you have destroyed enough of them)
+BLOODLUST_NEED = 3
+def bf_time(n):
+    """more players, more towers, so less time: 5:00 alone, 4:30 / 4:00 / 3:30 for 2 / 3 / 4"""
+    return BF_TIME - 30.0 * (max(1, min(4, n)) - 1)
+
+
+BF_TIME = 300.0              # the boss has to be dead before this many seconds have passed
+BF_SCARE_HP = 1080000        # the giant scarecrow's health (one player)
+BF_STAR_FIRST = 7.0          # seconds after the scarecrow stands up until the first stars
+BF_STAR_GAP = 16.0           # seconds between one set of stars being dealt with and the next
+BF_STAR_LIFE = 25.0          # seconds you have to destroy a star
+BF_STAR_WORK = 3.0           # seconds an orb has to stand on a star to destroy it
+BF_STAR_R = 40.0             # how close that is
+BF_STAR_HEAL = 15000         # what the scarecrow gains for every star that was not destroyed
+BF_DEAD_STUN = 38.0          # a tower the boss destroyed is out this long (a Mechanic brings it back much sooner)
+BF_VOX = {
+    1: ("Oh. A visitor. How polite, walking into my factory.", 0),
+    3: ("Those are my prototypes you are breaking. They took so long to grow.", 0),
+    6: ("Stop. Touching. My machines.", 1),
+    10: ("That one was a big one. Fine. I made it so you could break it.", 1),
+    13: ("Your little towers are cute. I will remove them one by one.", 1),
+    16: ("A SECOND DOOR. I built it for deliveries. Now it is for YOU.", 2),
+    20: ("Twenty waves. Do you never get tired? I do not. I do not get ANYTHING.", 2),
+    24: ("Why will you not break? EVERYTHING breaks.", 2),
+    28: ("I am being very patient. THIS is me being patient.", 3),
+    31: ("WHO LET YOU IN? WHO TAUGHT YOU TO DEFEND?", 3),
+    34: ("ENOUGH. I will build something that cannot be stopped.", 3),
+    37: ("Three more waves. THREE. And then I come down there MYSELF.", 4),
+    39: ("I CAN HEAR YOUR TOWERS HUMMING. I WILL TURN THEM OFF. ONE. BY. ONE.", 4),
+}
+BF_VOX_BOSS = ("I AM DESOLATION. AND NOW I WILL FINISH THIS MYSELF.", 4)
+BF_VOX_66 = ("YOU ARE DAMAGING ME. THAT IS NOT ALLOWED.", 4)
+BF_VOX_33 = ("I AM NOT DONE. I AM NEVER DONE!", 4)
+BF_VOX_DEATH = ("You might've damaged my armor, but I still have...", 4)
+BF_VOX_SCARE = ("...THE SCARECROW!  NOTHING BREAKS IT!", 4)
+BF_VOX_STARS = ("THE STARS FEED HIM. DESTROY THEM... IF YOU CAN.", 4)
+BF_VOX_MISS = ("YES. MORE. MORE POWER!", 4)
+BF_VOX_LOST = ("TOO SLOW. TOO SLOW. TOO SLOW.", 4)
+BF_VOX_END = ("I only wanted... to make something that stays.", 0)
+SHADOW_AT = (3.0, 5.15)       # where the shadow man hides on the Motherboard (cell), behind the cliffs
+SUP_K = 1.7                  # Commander buffs in real matches (7% becomes 12%, max level 10% becomes 17%, Call to Arms 22% becomes 37%)
+ENDLESS_PAY_CAP = 60         # waves past this earn no more coins or XP
+# the daily challenge: the same map and the same twist for everybody on the same day
+TWISTS = [
+    dict(key="speedy", name="SPEEDY", col=YELLOW, text="Enemies run 25% faster.", spd=1.25),
+    dict(key="tough", name="TOUGH BUT RICH", col=PURPLE, text="Enemies have 35% more health. You start with 900 extra cash.", hp=1.35, cash=900),
+    dict(key="sky", name="SKY ATTACK", col=CYAN, text="Flyers come early and often. Bring towers that shoot up!", air=True),
+    dict(key="glass", name="GLASS CORE", col=RED, text="Your core has only 40 health. Enemies are 15% weaker.", core=40, hp=0.85),
+    dict(key="poor", name="POOR START", col=ORANGE, text="You start with only 250 cash, but every wave pays 50% more.", cash_set=250, pay=1.5),
+]
+TWIST_BY_KEY = dict((t["key"], t) for t in TWISTS)
+AIR_SKY = {"drone": (1, 7, 3, 0.45), "gunship": (4, 26, 2, 1.2), "zeppelin": (8, 85, 1, 3.0)}
 HP_A, HP_B = 0.22, 0.016     # enemy health grows with the wave number: 1 + A*w + B*w*w
 BOSS_HP, BOSS_POW = 0.36, 1.25     # boss health = base * BOSS_HP * (wave growth ** BOSS_POW); the FINAL boss uses the difficulty's own number
 FINAL_SPD = 0.85             # the final boss walks a little slower than a normal boss
@@ -1611,6 +2069,8 @@ THEMES = {
                (("cloud", 6), ("island", 4)), (), None),
     "FACTORY": _th(((10, 8, 8), (58, 40, 26)), (30, 28, 30), (20, 18, 20), (66, 60, 58), (255, 150, 40), (82, 74, 72), "embers", "glow",
                    (("chimney", 4), ("tank", 3), ("crate", 3), ("pipe", 2)), (("crate", 1),), "tiles", (220, 110, 24)),
+    "BLOODFAC": _th(((14, 2, 4), (84, 12, 16)), (36, 14, 16), (24, 8, 10), (118, 32, 38), (255, 46, 56), (104, 56, 56), "embers", "glow",
+                    (("chimney", 4), ("tank", 4), ("crate", 3), ("pipe", 2)), (("crate", 1),), "tiles", (150, 14, 24), (24, 8, 10)),
     "SUNSET": _th(((30, 6, 54), (255, 104, 124)), (14, 8, 30), (10, 6, 22), (130, 44, 150), (255, 80, 200), (62, 32, 94), None, "sun",
                   (("palm", 6), ("billboard", 1), ("car", 2), ("pylon", 1)), (), None),
     "BOARD": _th(((2, 8, 6), (8, 44, 24)), (6, 30, 20), (4, 18, 12), (20, 92, 52), (120, 255, 90), (20, 86, 52), "glitch", None,
@@ -1717,7 +2177,7 @@ MAPS = [
              "One is right here in the water. One is in a grove. One is where everybody starts.",
              "Find all three and they will take you to their pond. Click them when you see them."])],
          secrets=[dict(id="duck3", prop="duckprop", at=(7.5, 8))]),
-    dict(id="crystal", name="CRYSTAL CAVERN", theme="CRYSTAL", need=9, title="GEMCUTTER", desc="A short road and cliffs everywhere. No time to think.",
+    dict(id="crystal", name="CRYSTAL CAVERN", theme="CRYSTAL", indoor=True, need=9, title="GEMCUTTER", desc="A short road and cliffs everywhere. No time to think.",
          paths=[[(-1, 8), (7, 8), (7, 4), (14, 4), (14, 11), (20, 11), (20, 7), (24, 7)]],
          cliffs=[(1, 3, 4, 6), (1, 10, 5, 13), (9, 6, 12, 9), (9, 11, 12, 13), (16, 5, 18, 9), (16, 13, 21, 14), (22, 9, 24, 12), (9, 0, 13, 2), (16, 1, 22, 4)],
          bosses=["titan", "queen", "architect"], hp=0.8,
@@ -1732,7 +2192,7 @@ MAPS = [
          npcs=[dict(name="CAPTAIN NIMBUS", at=(12.3, 4.7), hat="cap", col=WHITE, lines=[
              "Two lanes, one crossing. Whatever you build in the middle works twice.",
              "Do not look down."])]),
-    dict(id="foundry", name="THE FOUNDRY", theme="FACTORY", need=13, title="IRONHEART", desc="Three gates feed one conveyor. Block the merge.",
+    dict(id="foundry", name="THE FOUNDRY", theme="FACTORY", indoor=True, need=13, title="IRONHEART", desc="Three gates feed one conveyor. Block the merge.",
          paths=[[(-1, 2), (6, 2), (6, 8), (14, 8), (14, 12), (22, 12), (22, 7)],
                 [(-1, 13), (6, 13), (6, 8), (14, 8), (14, 12), (22, 12), (22, 7)],
                 [(18, -1), (18, 4), (10, 4), (10, 8), (14, 8), (14, 12), (22, 12), (22, 7)]],
@@ -1748,7 +2208,7 @@ MAPS = [
          npcs=[dict(name="DJ SUNDOWN", at=(12, 1), hat="cap", col=PINK, lines=[
              "Longest road in the sector. Great for Mortars. Great for sunsets.",
              "Somebody typed MEOW on the Motherboard once. The Motherboard answered."])]),
-    dict(id="board", name="MOTHERBOARD", theme="BOARD", need=17, title="OVERCLOCKED", desc="Two traces run side by side, then split. Guard the gap.",
+    dict(id="board", name="MOTHERBOARD", theme="BOARD", indoor=True, need=17, title="OVERCLOCKED", desc="Two traces run side by side, then split. Guard the gap.",
          paths=[[(-1, 3), (5, 3), (9, 7), (14, 7), (17, 4), (22, 4), (22, 9)],
                 [(-1, 13), (5, 13), (9, 9), (14, 9), (17, 12), (22, 12), (22, 9)]],
          cliffs=[(1, 6, 5, 10), (10, 2, 14, 4), (10, 12, 14, 14), (18, 6, 20, 10), (24, 6, 25, 11), (7, 0, 9, 1), (7, 14, 9, 15)],
@@ -1757,7 +2217,7 @@ MAPS = [
              "th3 c4t w4lks on th3 k3yb04rd.",
              "s4y its n4me in ch4t. h3re. on th1s b04rd.",
              "(It means: type MEOW in the chat. Press ENTER to chat.)"])]),
-    dict(id="core", name="CORRUPTED CORE", theme="CORRUPTED", need=20, title="ARCHITECT'S END", desc="They come from both sides. The Architect is waiting.",
+    dict(id="core", name="CORRUPTED CORE", theme="CORRUPTED", indoor=True, need=20, title="ARCHITECT'S END", desc="They come from both sides. The Architect is waiting.",
          paths=[[(-1, 2), (4, 2), (4, 13), (9, 13), (9, 4), (12, 4), (12, 8)],
                 [(26, 13), (21, 13), (21, 2), (16, 2), (16, 11), (12, 11), (12, 8)]],
          cliffs=[(6, 4, 7, 10), (18, 5, 19, 11), (13, 6, 15, 8), (0, 5, 2, 9), (23, 4, 25, 8)],
@@ -1766,14 +2226,14 @@ MAPS = [
              "This is where it started. The Architect built the Bastion. Then it changed its mind.",
              "It hacks towers. Spread them out, and bring a Mechanic."])]),
     # ---- event levels
-    dict(id="haunted", name="HAUNTED HOLLOW", theme="HALLOWEEN", need=1, event="haunted", skin="halloween", desc="A graveyard road. Everything here wears a hat.",
+    dict(id="haunted", name="HAUNTED HOLLOW", theme="HALLOWEEN", indoor=True, need=1, event="haunted", skin="halloween", desc="A graveyard road. Everything here wears a hat.",
          paths=[[(-1, 8), (4, 8), (4, 3), (10, 3), (10, 12), (16, 12), (16, 5), (21, 5), (21, 11), (24, 11)]],
          cliffs=[(6, 5, 8, 10), (12, 5, 14, 10), (18, 7, 19, 12), (1, 3, 2, 6), (1, 10, 7, 13), (12, 14, 18, 15), (23, 6, 25, 9), (12, 1, 18, 2)],
          bosses=["queen", "overseer", "pumpking"],
          npcs=[dict(name="JACK", at=(7, 1.3), hat="top", col=ORANGE, lines=[
              "Welcome to the Hollow. Mind the hats.",
              "The King comes last. He is mostly hat."])]),
-    dict(id="winter", name="WINTER WORKS", theme="XMAS", need=1, event="winter", skin="xmas", desc="The toy factory has been taken over. The elves are furious.",
+    dict(id="winter", name="WINTER WORKS", theme="XMAS", indoor=True, need=1, event="winter", skin="xmas", desc="The toy factory has been taken over. The elves are furious.",
          paths=[[(26, 3), (8, 3), (4, 7), (8, 11), (19, 11), (19, 7), (13, 7)]],
          cliffs=[(9, 5, 11, 9), (14, 5, 17, 5), (14, 9, 17, 9), (21, 5, 24, 9), (0, 1, 2, 4), (0, 10, 3, 13), (10, 13, 17, 14), (10, 0, 16, 1)],
          bosses=["queen", "titan", "frostlord"],
@@ -1788,7 +2248,7 @@ MAPS = [
          bosses=["overseer", "titan", "megaduck"],
          npcs=[dict(name="QUACKMASTER", at=(14.5, 1.2), hat="crown", col=YELLOW, lines=[
              "Quack.", "Quack quack.", "(He says the big one comes last. He says it has sunglasses.)"])]),
-    dict(id="kitchen", name="THE KITCHEN", theme="KITCHEN", need=1, event="kitchen", skin="kitchen", desc="Everything here is food or a weapon. Sometimes both.",
+    dict(id="kitchen", name="THE KITCHEN", theme="KITCHEN", indoor=True, need=1, event="kitchen", skin="kitchen", desc="Everything here is food or a weapon. Sometimes both.",
          paths=[[(-1, 12), (6, 12), (6, 3), (12, 3), (12, 12), (18, 12), (18, 3), (24, 3)]],
          cliffs=[(1, 5, 4, 10), (8, 5, 10, 10), (14, 5, 16, 10), (20, 5, 23, 10), (8, 14, 16, 15), (1, 0, 4, 1)],
          bosses=["queen", "titan", "headchef"],
@@ -1801,7 +2261,7 @@ MAPS = [
          bosses=["titan", "queen", "bluescreen"], hp=1.2,
          npcs=[dict(name="N0NE", at=(17, 4.6), hat="antenna", col=MAGENTA, lines=[
              "404: dialogue not found.", "404: second dialogue also not found.", "200: OK fine. The cat lives here. Do not touch its keyboard."])]),
-    dict(id="market", name="STONK MARKET", theme="MARKET", need=1, event="market", skin="market", desc="The road is a price chart. It only goes up. Mostly.",
+    dict(id="market", name="STONK MARKET", theme="MARKET", indoor=True, need=1, event="market", skin="market", desc="The road is a price chart. It only goes up. Mostly.",
          paths=[[(-1, 13), (4, 13), (7, 9), (10, 12), (14, 5), (17, 9), (21, 2), (24, 2)]],
          cliffs=[(1, 8, 3, 10), (8, 4, 11, 7), (12, 10, 15, 14), (18, 10, 22, 13), (15, 1, 18, 3), (22, 5, 24, 9), (4, 1, 8, 2)],
          bosses=["overseer", "queen", "bear"], hp=0.9,
@@ -2018,6 +2478,16 @@ def buff_text(b):
     return "  ".join("+%d%% %s" % (round(v * 100), BUFF_WORDS[k]) for k, v in b.items())
 
 
+MAPS.append(dict(
+    id="blood", name="BLOOD FACTORY", theme="BLOODFAC", indoor=True, need=1, event="blood", secret=True, title="DESOLATION",
+    desc="A factory that grows monsters. Survive 40 waves. Something is watching.",
+    paths=[[(-1, 2), (9, 2, 0, "b"), (9, 6), (3, 6), (3, 10, 0, "b"), (12, 10), (12, 13), (19, 13), (19, 8), (23, 8)],
+           [(21, -1), (21, 4), (15, 4, 0, "b"), (15, 8), (19, 8), (23, 8)]],
+    cliffs=[(5, 3, 8, 4, 1), (0, 7, 1, 9, 1), (6, 11, 10, 12, 1), (14, 10, 17, 11, 1), (22, 10, 24, 13, 1), (11, 0, 14, 1, 1), (23, 1, 25, 3, 1), (17, 6, 18, 6, 1),
+            (6, 3, 7, 4, 2), (7, 11, 9, 11, 2), (22, 11, 23, 12, 2)],
+    bosses=["overseer", "titan", "desolation"], hp=1.0, cash=300, npcs=[], hitcash=1.5, open={1: 16}, waves=40, coins=1500,
+    dover=dict(waves=40, hp=0.95, hpw=0.012, boss=150000, coins=1500, xpwin=800, first=0, per=10, xp=18, cash=800, early=1, core=100)))
+
 MAP_BY_ID = {}
 for _m in MAPS:
     _g = MAP_GEO.get(_m["id"], {})
@@ -2037,6 +2507,157 @@ for _i, _m in enumerate(MAPS):
         _n["id"] = "%s.%d" % (_m["id"], _j)
 MAIN_MAPS = [m for m in MAPS if not m.get("event")]
 
+# ---------------------------------------------------------------- maps you draw yourself (MY MAPS + the map editor)
+CUSTOM_MAX = 12
+CUSTOM_BOSSES = ["titan", "queen", "overseer"]
+CUSTOM_PREFIX = "NBMAP1:"
+
+
+def custom_clean(d):
+    """check a map somebody drew (or sent) and tidy it up.  -> a clean dict, or None when it is not a map.
+    A road point is [column, row, level, bridge?].  A hill is [column, row, column, row, level]."""
+    try:
+        name = "".join(ch for ch in str(d.get("name", "MY MAP")).upper() if ch.isalnum() or ch in " -")[:16].strip() or "MY MAP"
+        theme = d.get("theme") if d.get("theme") in THEMES else "GRID"
+        paths = []
+        for p in list(d.get("paths", []))[:2]:
+            pts = []
+            for q in list(p)[:60]:
+                lv = int(q[2]) if len(q) > 2 else 0
+                pts.append([int(clamp(int(q[0]), -1, COLS)), int(clamp(int(q[1]), -1, ROWS)), int(clamp(lv, 0, 3)), 1 if (len(q) > 3 and q[3]) else 0])
+            if len(pts) >= 2:
+                paths.append(pts)
+        if not paths:
+            return None
+        cliffs = []
+        for q in list(d.get("cliffs", []))[:80]:
+            c0, r0, c1, r1, lv = [int(v) for v in q[:5]]
+            cliffs.append([int(clamp(min(c0, c1), 0, COLS - 1)), int(clamp(min(r0, r1), 0, ROWS - 1)), int(clamp(max(c0, c1), 0, COLS - 1)),
+                           int(clamp(max(r0, r1), 0, ROWS - 1)), int(clamp(lv, 0, 3))])
+        return dict(name=name, theme=theme, paths=paths, cliffs=cliffs)
+    except Exception:
+        return None
+
+
+def custom_cells(p):
+    return [((q[0], q[1], q[2], "b") if q[3] else (q[0], q[1], q[2])) for q in p]
+
+
+def custom_problem(c):
+    """what is wrong with this map, in plain words ("" when it is fine)"""
+    ps = c["paths"]
+    for n, p in enumerate(ps):
+        walk = 0
+        for a, b in zip(p, p[1:]):
+            if a[0] != b[0] and a[1] != b[1]:
+                return "Road %d has a slanted piece." % (n + 1)
+            walk += abs(a[0] - b[0]) + abs(a[1] - b[1])
+        if walk < 8:
+            return "Road %d is too short. Draw it longer." % (n + 1)
+        if not (0 <= p[-1][0] < COLS and 0 <= p[-1][1] < ROWS):
+            return "Road %d has to end inside the map, on the core." % (n + 1)
+        for q in p[1:-1]:
+            if not (0 <= q[0] < COLS and 0 <= q[1] < ROWS):
+                return "Road %d leaves the map in the middle." % (n + 1)
+    if len(ps) == 2 and ps[0][-1][:2] != ps[1][-1][:2]:
+        return "Both roads must end on the same spot: the core."
+    paths = [Path(custom_cells(p)) for p in ps]
+    core = paths[0].pts[-1]
+    samp = []
+    for pi, p in enumerate(paths):
+        d = 0.0
+        while d <= p.length:
+            x, y, _ = p.at(d)
+            if math.hypot(x - core[0], y - core[1]) > 80:
+                samp.append((x, y, p.zat(d), pi, d))
+            d += 10.0
+    for i in range(len(samp)):
+        a = samp[i]
+        for j in range(i + 1, len(samp)):
+            b = samp[j]
+            if a[3] == b[3] and abs(a[4] - b[4]) < 90:
+                continue
+            if abs(a[0] - b[0]) < 30 and abs(a[1] - b[1]) < 30 and abs(a[2] - b[2]) < STEP * 0.9:
+                return "Two roads touch. Raise one so it goes over the other like a bridge."
+    return ""
+
+
+def custom_map(c):
+    """the full map (the kind the game plays) for a clean custom map"""
+    cid = "c_" + hashlib.sha1(json.dumps(c, sort_keys=True).encode()).hexdigest()[:8]
+    m = MAP_BY_ID.get(cid)
+    if m is None:
+        m = dict(id=cid, name=c["name"], theme=c["theme"], need=1, title="MAPMAKER", desc="A map somebody drew.",
+                 paths=[custom_cells(p) for p in c["paths"]], cliffs=[tuple(q) for q in c["cliffs"]], bosses=list(CUSTOM_BOSSES),
+                 npcs=[], secrets=[], custom=True, raw=c, i=1000 + int(cid[2:], 16) % 90000)
+        MAP_BY_ID[cid] = m
+    return m
+
+
+def custom_code(c):
+    import base64
+    return CUSTOM_PREFIX + base64.urlsafe_b64encode(zlib.compress(json.dumps(c, separators=(",", ":")).encode(), 9)).decode()
+
+
+def custom_from_code(txt):
+    """-> (clean map, "") or (None, what is wrong)"""
+    import base64
+    try:
+        t = "".join(str(txt).split())
+        i = t.find(CUSTOM_PREFIX)
+        if i < 0:
+            return None, "That is not a map code. It starts with " + CUSTOM_PREFIX
+        raw = t[i + len(CUSTOM_PREFIX):]
+        raw += "=" * (-len(raw) % 4)
+        c = custom_clean(json.loads(zlib.decompress(base64.urlsafe_b64decode(raw.encode()), 0, 200000).decode()))
+    except Exception:
+        return None, "That map code is broken (part of it is missing?)."
+    if c is None:
+        return None, "That code does not hold a map."
+    why = custom_problem(c)
+    return (None, why) if why else (c, "")
+
+
+def clip_put(txt):
+    try:
+        pygame.scrap.init()
+        pygame.scrap.put_text(txt)
+        return True
+    except Exception:
+        pass
+    try:
+        import tkinter
+        r = tkinter.Tk()
+        r.withdraw()
+        r.clipboard_clear()
+        r.clipboard_append(txt)
+        r.update()
+        r.destroy()
+        return True
+    except Exception:
+        return False
+
+
+def clip_get():
+    try:
+        pygame.scrap.init()
+        t = pygame.scrap.get_text()
+        if t:
+            return t
+    except Exception:
+        pass
+    try:
+        import tkinter
+        r = tkinter.Tk()
+        r.withdraw()
+        t = r.clipboard_get()
+        r.destroy()
+        return t
+    except Exception:
+        return ""
+
+
+
 # ---------------------------------------------------------------- events
 # season = ((month, day) start, (month, day) end).  Secret events last EVENT_DAYS from the moment you unlock them.
 EVENT_DAYS = 7
@@ -2050,6 +2671,7 @@ EVENTS = {
     "glitch": dict(name="404", kind="secret", tower="cat", title="catperson", col=(255, 0, 255), hint="s0m3th1ng is wr0ng w1th a b04rd."),
     "market": dict(name="STONK MARKET", kind="secret", tower="stonks", title="stonks", col=(60, 235, 130), hint="A broker respects one thing only."),
     "quarry": dict(name="THE QUARRY", kind="secret", tower="brick", title="brick", col=(255, 210, 40), hint="A mason misses the old walls."),
+    "blood": dict(name="BLOOD FACTORY", kind="special", tower="chainsaw", title="desolation", col=(255, 40, 50), hint="Something red is watching you. It hides in the waves."),
 }
 EVENT_ORDER = list(EVENTS)
 QUEST_EVENT = {"knock": "haunted", "pine": "winter", "ducks": "pond", "toast": "kitchen", "meow": "glitch", "stonks": "market", "brick": "quarry"}
@@ -2089,6 +2711,8 @@ def event_state(save, ev, now=None, today=None):
     t0 = save["events"].get(ev)
     if t0 is None:
         return "locked", 0
+    if e["kind"] == "special":
+        return "live", 0                    # a special event never ends
     if e["kind"] == "secret":
         left = t0 + EVENT_DAYS * 86400 - now
         if left > 0:
@@ -2115,11 +2739,12 @@ TITLES = {
     "stonks": ("DIAMOND HANDS", "Beat STONK MARKET."),
     "brick": ("UNBREAKABLE", "Beat THE QUARRY."),
     "secrets": ("SECRET KEEPER", "Unlock every secret event."),
+    "desolation": ("DESOLATION'S END", "Beat the BLOOD FACTORY."),
 }
 for _m in MAIN_MAPS:
     TITLES["m_" + _m["id"]] = (_m["title"], "Beat %s on Insane." % _m["name"])
 TITLE_ORDER = ["rookie", "defender"] + ["m_" + m["id"] for m in MAIN_MAPS] + ["veteran", "hardliner", "insane", "flawless", "team", "chatter", "legend",
-                                                                           "pumpkin", "frost", "duck", "chef", "catperson", "stonks", "brick", "secrets"]
+                                                                           "pumpkin", "frost", "duck", "chef", "catperson", "stonks", "brick", "secrets", "desolation"]
 
 
 # ======================================================================
@@ -3746,7 +4371,26 @@ def tm_summoner(b, lv):
     b.glow(0, 0, 4, 12, R_ALT, 0.5)
 
 
+def tm_chainsaw(b, lv):
+    """a red saw-mill gate: a feed table with a huge toothed blade standing in a frame, spinning"""
+    z = _pad(b, lv, 13)
+    h = 12 + lv * 1.6
+    for o in (-8, 8):
+        b.box(0, o, z, 2.4, 2.0, h, R_DARK, 0.88)
+    b.box(0, 0, z + h, 2.8, 10.5, 2.2, R_MAIN)
+    b.box(-3, 0, z, 6, 7.5, 3.2, R_METAL)
+    b.group(M_SPIN, 3.2 + lv * 0.5, 0, 0, z + h * 0.52)
+    n = 10 + lv * 2
+    b.prism(14, 0, 0, -0.5, 6.4 + lv * 0.5, 1.0, R_WHITE)
+    for i in range(n):
+        a = i * TAU / n
+        rr = 7.0 + lv * 0.5
+        b.box(math.cos(a) * rr, math.sin(a) * rr, -0.4, 1.0, 1.0, 1.2, R_LITE, 1.0, a)
+    b.glow(0, 0, 0.4, 14 + lv, R_MAIN, 0.5)
+
+
 TOWER_MODELS = {
+    "chainsaw": tm_chainsaw,
     "blaster": tm_blaster, "blade": tm_blade, "rail": tm_rail, "scatter": tm_scatter, "cryo": tm_cryo, "mortar": tm_mortar,
     "harvester": tm_harvester, "sentinel": tm_sentinel, "tesla": tm_tesla, "beacon": tm_beacon, "commander": tm_commander,
     "prism": tm_prism, "annihilator": tm_annihilator, "hydra": tm_hydra, "graviton": tm_graviton, "mechanic": tm_mechanic,
@@ -3786,6 +4430,55 @@ def em_runner(b):
     b.mesh([(10, 0, 3), (-7, -5.5, 2), (-7, 5.5, 2), (-3, 0, 7)], [(0, 1, 3), (0, 3, 2), (1, 2, 3), (0, 2, 1)], R_MAIN)
     b.slab([(-4, 0, 5), (-11, 0, 10), (-8, 0, 3)], R_LITE)
     return 8, -2, 3.5
+
+
+def em_drone(b):
+    b.group(M_AIM)
+    b.ball(0, 0, 3, 3.6, R_MAIN)
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            b.bar((0, 0, 3.5), (6.5 * sx, 6.5 * sy, 4.5), 0.7, R_DARK, 4)
+            b.ring(6.5 * sx, 6.5 * sy, 5, 3.4, R_LITE, 8, 1)
+    b.ball(3, 0, 3.4, 1.4, R_WHITE)
+    return 7, 0, 4
+
+
+def em_gunship(b):
+    b.group(M_AIM)
+    b.ball(0, 0, 4, 6.5, R_MAIN)
+    b.ball(4.5, 0, 5, 3.6, R_LITE)
+    b.bar((-4, 0, 5), (-16, 0, 7), 1.5, R_DARK, 4, 0.6)
+    b.slab([(-14, 0, 6), (-17, 0, 6), (-17, 0, 12), (-14, 0, 9)], R_ALT)
+    b.bar((0, 0, 10.5), (0, 0, 11.5), 1.0, R_DARK, 4)
+    b.ring(0, 0, 11.5, 13, R_LITE, 12, 1)
+    b.bar((-5, -5, 0), (5, -5, 0), 0.7, R_DARK, 4)
+    b.bar((-5, 5, 0), (5, 5, 0), 0.7, R_DARK, 4)
+    b.bar((4.5, 0, 3), (7, 0, 5), 0.8, R_BLACK, 4)
+    return 12, 0, 6
+
+
+def em_zeppelin(b):
+    b.group(M_AIM)
+    for x, rr in ((-12, 6.5), (-5, 9), (3, 9.5), (11, 7.5)):
+        b.ball(x, 0, 8, rr, R_MAIN)
+    b.box(2, 0, 0, 6, 2.5, 2.5, R_DARK)
+    b.slab([(-16, 0, 8), (-23, 0, 8), (-23, 0, 17), (-17, 0, 13)], R_ALT)
+    b.slab([(-16, 0, 8), (-23, 0, 8), (-23, 0, -1), (-17, 0, 3)], R_ALT)
+    b.ring(14, 0, 8, 3.5, R_LITE, 8, 1)
+    return 18, 0, 8
+
+
+def em_bloodlust(b):
+    b.group(M_AIM)
+    b.ball(0, 0, 7, 8.5, R_MAIN)
+    b.ball(5.5, 0, 9.5, 5.2, R_DARK)
+    for sy in (-1, 1):
+        b.bar((1, 6 * sy, 8), (-7, 11 * sy, 14), 1.2, R_ALT, 4)
+        b.bar((-1, 5 * sy, 4), (-9, 9 * sy, 0), 1.6, R_DARK, 4)
+        b.ball(8.6, 2.2 * sy, 11, 1.1, (255, 240, 150))
+    for i in range(5):
+        b.prism(3, -3 - i * 2.2, 0, 14 - i * 0.6, 1.8, 6, R_ALT, rtop=0)
+    return 16, 4, 6
 
 
 def em_swarm(b):
@@ -3946,9 +4639,58 @@ def em_megaduck(b):
     return 58, 14, 9
 
 
+def em_desolation(b):
+    b.group(M_AIM)
+    b.box(0, -8, 0, 6.5, 5.5, 20, R_BLACK)
+    b.box(0, 8, 0, 6.5, 5.5, 20, R_BLACK)
+    b.box(-1, 0, 20, 11, 15, 22, R_DARK, 0.86)
+    b.box(2, 0, 42, 9, 17, 6, R_MAIN)
+    b.box(5, 0, 47, 6.5, 6.5, 7.5, R_BLACK)
+    b.slab([(11.6, -5, 51), (11.6, 5, 51), (11.6, 4, 49), (11.6, -4, 49)], R_WHITE)
+    b.glow(11.8, 0, 50, 11, R_LITE, 0.9)
+    b.ball(7, 0, 33, 4.2, R_LITE)
+    b.glow(8, 0, 33, 20, R_MAIN, 0.7)
+    for sy in (-1, 1):
+        b.bar((1, sy * 18, 40), (9, sy * 24, 27), 4.4, R_DARK, 4)
+        b.group(M_AIM | M_STRIKE)
+        b.bar((9, sy * 24, 27), (27, sy * 25, 18), 3.0, R_METAL, 4)
+        b.box(21, sy * 25, 17.5, 11, 1.6, 4.4, R_WHITE, 0.95)
+        for k in range(6):
+            b.box(12 + k * 3.1, sy * 25, 22.4, 0.9, 1.7, 1.2, R_LITE)
+            b.box(12 + k * 3.1, sy * 25, 15.2, 0.9, 1.7, 1.2, R_LITE)
+        b.group(M_AIM)
+    return 55, 5, 8
+
+
+def em_scarecrow(b):
+    b.group(M_AIM)
+    b.bar((0, 0, 0), (0, 0, 80), 4.2, R_DARK, 6)
+    b.prism(8, 0, 0, 0, 11, 3, R_DARK)
+    b.bar((0, -60, 66), (0, 60, 66), 3.4, R_DARK, 6)
+    b.ball(0, 0, 48, 20, R_MAIN)
+    b.ball(0, 0, 30, 17, R_ALT)
+    b.ball(0, 0, 14, 11, R_MAIN)
+    for sy in (-1, 1):
+        b.ball(0, sy * 48, 66, 8, R_MAIN)
+        b.ball(0, sy * 60, 62, 6, R_ALT)
+        for k in range(3):
+            b.bar((0, sy * 62, 62), (1, sy * (68 + k * 3), 52 - k * 6), 1.3, R_LITE, 4)
+    b.ball(1, 0, 90, 15, R_ALT)
+    b.prism(10, 0, 0, 98, 25, 3, R_BLACK)
+    b.prism(10, 0, 0, 101, 13, 22, R_BLACK, rtop=9)
+    b.prism(10, 0, 0, 104, 13.4, 3.4, R_METAL)
+    for sy in (-1, 1):
+        b.ball(12.5, sy * 6, 92, 3.6, R_BLACK)
+        b.glow(14.5, sy * 6, 92, 11, R_LITE, 0.9)
+    b.line([(15, -8, 83), (15.6, -4, 81), (15.6, 0, 83), (15.6, 4, 81), (15, 8, 83)], R_BLACK, 2)
+    return 112, 3, 14
+
+
 ENEMY_MODELS = {
+    "desolation": em_desolation, "scarecrow": em_scarecrow,
     "grunt": em_grunt, "runner": em_runner, "swarm": em_swarm, "tank": em_tank, "shield": em_shield, "splitter": em_splitter,
     "mini": em_mini, "healer": em_healer, "blinker": em_blinker, "phantom": em_phantom, "elite": em_elite, "jugger": em_jugger,
+    "bloodlust": em_bloodlust, "drone": em_drone, "gunship": em_gunship, "zeppelin": em_zeppelin,
     "overseer": em_overseer, "queen": em_queen, "titan": em_titan, "architect": em_architect, "megaduck": em_megaduck,
 }
 _enemy_models = {}
@@ -4106,7 +4848,12 @@ def npc_model(hat):
             b.prism(8, 0, 0, 18.2, 4.2, 3, HARDHAT, rtop=2.4)
         elif hat == "crown":
             b.prism(6, 0, 0, 17.8, 3.4, 3.4, R_ALT, rtop=4.6)
-        m = _misc_models[key] = b.done(30)
+        elif hat == "shadow":
+            b.prism(8, 0, 0, 0, 8.5, 22, R_DARK, rtop=2.4)
+            b.prism(8, 0, 0, 17, 5.6, 14, R_DARK, rtop=0.6)
+            b.ball(3.2, -1.8, 20, 1.3, (255, 40, 60))
+            b.ball(3.2, 1.8, 20, 1.3, (255, 40, 60))
+        m = _misc_models[key] = b.done(38 if hat == "shadow" else 30)
     return m
 
 
@@ -7135,6 +7882,13 @@ def _mk2_towers_b():
                 b.line([(-2.55, -2.6, 10.6), (-4.85, -3.4, 3.5), (-4.85, 3.4, 3.5), (-2.55, 2.6, 10.6)], R_ALT, 2)
         if lv >= 4:                                                                # a crowned helm
             b.ring(0.3, 0, 13.3, 1.9, R_ALT, 8, 3)
+        if lv >= 5:                                                                # the KING: a tall crown, a red cloak, a bigger sword
+            for i in range(5):
+                a = i * TAU / 5 + 0.3
+                cx_, cy_ = 0.3 + math.cos(a) * 1.8, math.sin(a) * 1.8
+                b.crystal(cx_, cy_, 13.3, 0.55, 3.2, R_ALT, 4)
+            b.slab([(-2.6, -3.0, 10.8), (-2.6, 3.0, 10.8), (-5.6, 4.0, 1.5), (-5.6, -4.0, 1.5)], R_ALT)
+            b.glow(0.3, 0, 14.5, 4.5, R_ALT, 0.7)
         # sword arm
         b.group(M_AIM | M_STRIKE, 0, 0, 0, 0, 4.0, 1.5)
         b.bar((0, 3.7, 9.9), (3.2, 4.5, 8.6), 0.95, R_DARK, 4)
@@ -8133,7 +8887,7 @@ class Scene:
 
     def backdrop(self, s, w, cam, t):
         th = w.theme
-        if cam.ortho:
+        if cam.ortho or w.map.get("indoor"):
             s.fill(th["apron"])
             return
         tp = math.tan(clamp(cam.pitch, -1.4, 1.4))
@@ -8196,6 +8950,8 @@ class Scene:
         r = self.r
         th = w.theme
         acc = th["accent"]
+        if w.map.get("indoor"):
+            self.indoor_floor(w, cam)
         g2 = scale_col(th["grid"], 0.55)
         if not cam.ortho:
             for x in range(-480, FW + 481, 120):
@@ -8263,7 +9019,9 @@ class Scene:
         col = scale_col(th["accent"], 0.42)
         gap = 70 if detail > 1 else 140
         self.arrows = []        # arrows on raised road are drawn after the land they lie on
-        for p in w.paths:
+        for pi_, p in enumerate(w.paths):
+            if not w.path_open(pi_):
+                continue
             d = (t * 46) % gap
             while d < p.length - 30:
                 x, y, seg = p.at(d)
@@ -8354,6 +9112,11 @@ class Scene:
                 self.flat_fx(2, c, z, t)
         # ---- everything that stands up, far to near
         self.labels = []
+        if w.map.get("indoor") and not flat:
+            self.draw_walls(w, cam, t)
+        self.draw_hazards(w, cam, t)
+        if getattr(w, "bf", None):
+            self.draw_bf(w, cam, t)
         self.opt = o
         items = []
         f0, f1, f2 = cam.f
@@ -8380,9 +9143,9 @@ class Scene:
         for c in w.casts:
             things.append((c["x"], c["y"], w.top(c["x"], c["y"]) if raised else 0.0, 0.0, 5, c, True))
         things.append((w.core[0], w.core[1], w.corez, 24.0, 6, None, True))
-        for p in w.paths:
+        for pi_, p in enumerate(w.paths):
             gx, gy = clamp(p.pts[0][0], 6, FW - 6), clamp(p.pts[0][1], 6, FH - 6)
-            things.append((gx, gy, p.zs[0], 14.0, 7, (gx, gy, p.angs[0], p.zs[0]), True))
+            things.append((gx, gy, p.zs[0], 14.0, 7, (gx, gy, p.angs[0], p.zs[0], pi_), True))
         for k, ob, z in late:
             things.append((ob[0] if k < 2 else ob["x"], ob[1] if k < 2 else ob["y"], z if k != 1 else ob[2], 0.0, 9, (k, ob, z), True))
         if not flat:
@@ -8478,7 +9241,18 @@ class Scene:
                 cam.z += zb
             elif kind == 7:
                 gm = gate_model()
-                r.model(gm, palette(mix_col(acc, PINK, 0.5), gm.fixed), ob[0], ob[1], ob[3], ob[2], t)
+                if not w.path_open(ob[4]):
+                    r.model(gm, palette((90, 44, 48), gm.fixed), ob[0], ob[1], ob[3], ob[2], t)
+                    ca_, sa_ = math.cos(ob[2]), math.sin(ob[2])
+                    px_, py_ = -sa_ * 34, ca_ * 34
+                    for k_ in range(6):
+                        zz_ = ob[3] + 4 + k_ * 7
+                        r.line((ob[0] + px_, ob[1] + py_, zz_), (ob[0] - px_, ob[1] - py_, zz_), (255, 70, 80) if k_ % 2 else (150, 30, 40), 3)
+                    q_ = cam.pt(ob[0], ob[1], ob[3] + 56)
+                    if q_ is not None:
+                        self.labels.append((0, "SEALED  (wave %d)" % w.map["open"][ob[4]], 15, (255, 120, 120), q_[0], q_[1]))
+                else:
+                    r.model(gm, palette(mix_col(acc, PINK, 0.5), gm.fixed), ob[0], ob[1], ob[3], ob[2], t)
             elif kind == 13:
                 self.draw_goon(w, ob, t, detail)
             elif kind == 12:
@@ -8510,17 +9284,51 @@ class Scene:
             q = pt(p[0], p[1], p[2])
             if q is not None:
                 k = p[6] / p[7]
+                if len(p) > 10 and p[11]:
+                    st = p[11]
+                    if st == 2:
+                        # smoke: a soft ball that grows and fades
+                        rr = max(2, int(p[9] * q[2] * (1.6 - k * 0.9)))
+                        pygame.draw.circle(s, scale_col(mix_col(p[8], (150, 150, 170), 0.55), 0.22 + 0.5 * k), (int(q[0]), int(q[1])), rr)
+                    elif st == 1:
+                        # a spark: a short bright streak the way it is flying
+                        q2 = pt(p[0] - p[3] * 0.045, p[1] - p[4] * 0.045, p[2] - p[5] * 0.045)
+                        c = mix_col(p[8], WHITE, 0.55 * k)
+                        if q2 is not None:
+                            pygame.draw.line(s, scale_col(c, 0.4 + 0.6 * k), (q[0], q[1]), (q2[0], q2[1]), max(1, int(p[9] * q[2] * 0.6)))
+                        glow(s, q[0], q[1], 7 * p[9] * q[2], p[8], 0.5 * k)
+                    else:
+                        # an ember: glows, and shrinks as it cools
+                        sz = max(2, int(p[9] * q[2] * (0.4 + k * 0.7)))
+                        glow(s, q[0], q[1], 6 * p[9] * q[2], p[8], 0.7 * k)
+                        fill(mix_col(p[8], WHITE, 0.5 * k), (q[0] - sz * 0.5, q[1] - sz * 0.5, sz, sz))
+                    continue
                 sz = max(2, int(p[9] * q[2] * (0.5 + k * 0.5)))
                 fill(scale_col(p[8], 0.3 + 0.7 * k), (q[0] - sz * 0.5, q[1] - sz * 0.5, sz, sz))
+        if w.map.get("indoor") and not flat:
+            self.draw_roof(w, cam, t)
         self.ambient(w, cam, t)
         # ---- circles and boxes
         self.overlays(w, cam, o, t)
         # ---- names, health bars and tags, on top of the 3D world
         rect = pygame.draw.rect
+        placed = []             # where words already are: a word that would sit on top of another is nudged up so both can be read
         for lb in self.labels:
             k = lb[0]
             if k == 0:
-                draw_text(s, lb[1], lb[2], lb[3], lb[4], lb[5])
+                tw_, th_ = font(lb[2]).size(lb[1])
+                lx, ly = lb[4], lb[5]
+                for _try in range(7):
+                    hit = False
+                    for (px_, py_, pw_, ph_) in placed[-48:]:
+                        if abs(lx - px_) * 2 < tw_ + pw_ - 2 and abs(ly - py_) * 2 < th_ + ph_ - 4:
+                            ly = py_ - (th_ + ph_) / 2.0 + 2
+                            hit = True
+                            break
+                    if not hit:
+                        break
+                placed.append((lx, ly, tw_, th_))
+                draw_text(s, lb[1], lb[2], lb[3], lx, ly)
             elif k == 1:
                 x, y, bw, bh, f, col = lb[1:]
                 rect(s, (30, 10, 18), (x - bw / 2 - 1, y - 1, bw + 2, bh + 2))
@@ -8543,7 +9351,19 @@ class Scene:
             q = pt(tx[0], tx[1], tx[2])
             if q is not None and 0 < q[0] < W and 0 < q[1] < H:
                 k = tx[5] / tx[6]
-                draw_text(s, tx[3], tx[7], tx[4] if k > 0.35 else scale_col(tx[4], 0.3 + k * 2), q[0], q[1])
+                tw_, th_ = font(tx[7]).size(tx[3])
+                lx, ly = q[0], q[1]
+                for _try in range(5):
+                    hit = False
+                    for (px_, py_, pw_, ph_) in placed[-48:]:
+                        if abs(lx - px_) * 2 < tw_ + pw_ - 2 and abs(ly - py_) * 2 < th_ + ph_ - 4:
+                            ly = py_ - (th_ + ph_) / 2.0 + 2
+                            hit = True
+                            break
+                    if not hit:
+                        break
+                placed.append((lx, ly, tw_, th_))
+                draw_text(s, tx[3], tx[7], tx[4] if k > 0.35 else scale_col(tx[4], 0.3 + k * 2), lx, ly)
 
     def static_list(self, w):
         """cliffs, scenery and landmarks of THIS match: [model, colours, x, y, z, angle, size, top, show, plant spot, cliff square, reach]"""
@@ -8605,6 +9425,438 @@ class Scene:
                 props.append(it)
         return cliffs, props
 
+    # ------------------------------------------------------------ indoor rooms
+    def room(self, w):
+        mid = w.map.get("id", "")
+        c = getattr(self, "_room", None)
+        if c is None or c[0] != mid:
+            K, walls, roof = in_kit(w.map.get("theme"), mid)
+            c = self._room = (mid, K, walls, roof)
+        return c[1], c[2], c[3]
+
+    def draw_walls(self, w, cam, t):
+        """the walls of an indoor map, with the things hung on them.  The walls between you and the map are left out, so you can see in."""
+        r = self.r
+        K, walls, roof = self.room(w)
+        th = w.theme
+        base, trim, glow = K["base"], K["trim"], K["glow"]
+        # the floor goes right out to the walls
+        o = IN_OFF
+        if cam.ortho:
+            return
+        inward = ((0, 1), (-1, 0), (0, -1), (1, 0))
+        for wi in range(4):
+            L = in_wall_len(wi)
+            p0 = in_wall_pt(wi, L / 2, 0)
+            nx, ny = inward[wi]
+            facing = (cam.x - p0[0]) * nx + (cam.y - p0[1]) * ny > 0
+            if not facing:
+                # the wall in front of you: only a low ledge, so nothing hides the map
+                a, b = in_wall_pt(wi, 0, 0), in_wall_pt(wi, L, 0)
+                a2, b2 = in_wall_pt(wi, 0, 12), in_wall_pt(wi, L, 12)
+                r.poly([a, b, b2, a2], scale_col(base, 0.7), scale_col(trim, 0.7))
+                continue
+            W = lambda s, h, wi=wi: in_wall_pt(wi, s, h)
+            r.poly([W(0, 0), W(L, 0), W(L, IN_WALL), W(0, IN_WALL)], base, scale_col(trim, 0.6))
+            r.line(W(0, IN_WALL - 6), W(L, IN_WALL - 6), trim, 3)
+            # pillars between the wall sections
+            for i in range(0, int(L // 260) + 1):
+                s = i * 260.0
+                r.poly([W(s - 7, 0), W(s + 7, 0), W(s + 7, IN_WALL), W(s - 7, IN_WALL)], scale_col(base, 1.35), scale_col(trim, 0.5))
+            for it in walls[wi]:
+                self.wall_item(wi, it, t, W, trim, glow)
+
+    def wall_item(self, wi, it, t, W, trim, glow):
+        r = self.r
+        k = it[0]
+        if k == "rect":
+            _, s0, h0, s1, h1, fill, edge = it
+            r.poly([W(s0, h0), W(s1, h0), W(s1, h1), W(s0, h1)], fill, edge)
+        elif k == "win":
+            _, s0, h0, s1, h1, col = it
+            fl = 0.75 + 0.25 * math.sin(t * 2.3 + s0 * 0.05)
+            r.poly([W(s0, h0), W(s1, h0), W(s1, h1), W(s0, h1)], scale_col(col, 0.45 * fl), scale_col(col, 0.9))
+            sm = (s0 + s1) / 2
+            r.line(W(sm, h0), W(sm, h1), scale_col(col, 0.9), 2)
+            r.line(W(s0, (h0 + h1) / 2), W(s1, (h0 + h1) / 2), scale_col(col, 0.9), 2)
+        elif k == "screen":
+            _, s0, h0, s1, h1, col = it
+            r.poly([W(s0, h0), W(s1, h0), W(s1, h1), W(s0, h1)], (6, 10, 18), col)
+            n = 6
+            for j in range(n):
+                hh = h0 + (h1 - h0) * (j + 1) / (n + 1)
+                ln = (s1 - s0) * (0.25 + 0.65 * (0.5 + 0.5 * math.sin(t * 1.7 + j * 2.1 + s0)))
+                r.line(W(s0 + 6, hh), W(s0 + 6 + ln, hh), scale_col(col, 0.9), 2)
+        elif k == "circle":
+            _, sc, hc, rad, fill, edge, spin = it
+            pts = [W(sc + math.cos(a * TAU / 14) * rad, hc + math.sin(a * TAU / 14) * rad) for a in range(14)]
+            r.poly(pts, fill, edge)
+            if spin:
+                a = t * spin
+                r.line(W(sc, hc), W(sc + math.cos(a) * rad * 0.85, hc + math.sin(a) * rad * 0.85), edge, 2)
+                if rad > 20:
+                    r.line(W(sc, hc), W(sc + math.cos(a + TAU / 3) * rad * 0.85, hc + math.sin(a + TAU / 3) * rad * 0.85), edge, 2)
+                    r.line(W(sc, hc), W(sc + math.cos(a + 2 * TAU / 3) * rad * 0.85, hc + math.sin(a + 2 * TAU / 3) * rad * 0.85), edge, 2)
+        elif k == "pipe":
+            _, s0, hh, s1, col, th_ = it
+            r.line(W(s0, hh), W(s1, hh), col, th_)
+        elif k == "stripes":
+            _, s0, h0, s1, h1 = it
+            n = int((s1 - s0) // 24)
+            for j in range(n):
+                a = s0 + j * 24
+                r.poly([W(a, h0), W(a + 12, h0), W(a + 24, h1), W(a + 12, h1)], (255, 200, 40) if j % 2 == 0 else (30, 30, 34))
+        elif k == "stripes2":
+            _, s0, h0, s1, h1 = it
+            n = int((s1 - s0) // 20)
+            for j in range(n):
+                a = s0 + j * 20
+                r.poly([W(a, h0), W(a + 10, h0), W(a + 10, h1), W(a, h1)], (230, 60, 60) if j % 2 == 0 else (240, 240, 240))
+        elif k == "lamp":
+            _, s, hh, col, sz = it
+            fl = 0.8 + 0.2 * math.sin(t * 7 + s)
+            p = W(s, hh)
+            r.dot(p[0], p[1], p[2], sz, scale_col(col, fl), 0.9)
+        elif k == "tri":
+            _, s, h0, wd, ht, fill, edge = it
+            r.poly([W(s - wd / 2, h0), W(s + wd / 2, h0), W(s, h0 + ht)], fill, edge)
+            p = W(s, h0 + ht * 0.4)
+            r.dot(p[0], p[1], p[2], 3, edge, 0.5 + 0.4 * math.sin(t * 2 + s))
+        elif k == "shelf":
+            _, s0, hh, s1, col = it
+            r.poly([W(s0, hh), W(s1, hh), W(s1, hh + 3), W(s0, hh + 3)], (110, 80, 56), (170, 130, 90))
+            n = int((s1 - s0) // 20)
+            for j in range(n):
+                a = s0 + 4 + j * 20
+                hgt = 8 + (j * 7) % 12
+                c = col if j % 2 == 0 else mix_col(col, WHITE, 0.4)
+                r.poly([W(a, hh + 3), W(a + 14, hh + 3), W(a + 14, hh + 3 + hgt), W(a, hh + 3 + hgt)], c, scale_col(c, 0.6))
+        elif k == "portrait":
+            _, s, hh = it
+            r.poly([W(s - 16, hh - 20), W(s + 16, hh - 20), W(s + 16, hh + 22), W(s - 16, hh + 22)], (40, 26, 20), (200, 160, 80))
+            r.poly([W(s + math.cos(a * TAU / 10) * 8, hh + 4 + math.sin(a * TAU / 10) * 9) for a in range(10)], (210, 220, 190), (120, 150, 100))
+            e = 0.5 + 0.5 * math.sin(t * 1.3 + s)
+            p1, p2 = W(s - 3, hh + 6), W(s + 3, hh + 6)
+            r.dot(p1[0], p1[1], p1[2], 1.5, (255, 60, 60), e)
+            r.dot(p2[0], p2[1], p2[2], 1.5, (255, 60, 60), e)
+        elif k == "text":
+            _, s, hh, txt, col, size = it
+            p = W(s, hh)
+            q = self.r.cam.pt(p[0], p[1], p[2])
+            if q is not None:
+                sz = int(clamp(size * q[2] * 1.9, 8, 24))
+                self.labels.append((0, txt, sz, col, q[0], q[1]))
+
+    def draw_roof(self, w, cam, t):
+        """the roof: beams you can see through, and the things that hang from it"""
+        if cam.ortho:
+            return
+        r = self.r
+        K, walls, roof = self.room(w)
+        trim, glow = K["trim"], K["glow"]
+        z = IN_ROOF
+        o = IN_OFF
+        beam = scale_col(trim, 0.55)
+        r.lines([(-o, -o, z), (FW + o, -o, z), (FW + o, FH + o, z), (-o, FH + o, z)], trim, 3, True)
+        for x in range(-int(o), int(FW + o) + 1, 130):
+            r.line((x, -o, z), (x, FH + o, z), beam, 2)
+        for y in range(-int(o), int(FH + o) + 1, 160):
+            r.line((-o, y, z), (FW + o, y, z), beam, 2)
+        for x in range(-int(o), int(FW + o) - 129, 260):
+            r.line((x, -o, z), (x + 130, FH + o, z - 6), scale_col(beam, 0.7), 1)
+        for it in roof:
+            k = it[0]
+            if k == "lamp":
+                _, x, y, ln, col = it
+                fl = 0.85 + 0.15 * math.sin(t * 6 + x)
+                r.line((x, y, z), (x, y, z - ln), (90, 90, 100), 1)
+                r.dot(x, y, z - ln, 9, scale_col(col, fl), 1.0)
+                r.ring(x, y, z - ln - 2, 10, scale_col(col, 0.7), 1, 10)
+            elif k == "pipe":
+                _, x0, y0, x1, y1, col = it
+                r.line((x0 - o, y0, z - 10), (x1 + o, y1, z - 10), col, 5)
+            elif k == "crane":
+                _, x0, y0, x1, y1, col = it
+                r.line((x0 - o, y0, z - 6), (x1 + o, y1, z - 6), col, 6)
+                hx = FW * (0.5 + 0.38 * math.sin(t * 0.35))
+                r.line((hx, y0, z - 6), (hx, y0, z - 60), (160, 160, 170), 2)
+                r.poly([(hx - 7, y0 - 7, z - 70), (hx + 7, y0 - 7, z - 70), (hx + 7, y0 + 7, z - 70), (hx - 7, y0 + 7, z - 70)], (60, 60, 70), col)
+            elif k == "cable":
+                _, x0, y0, x1, y1, col = it
+                pts = []
+                for j in range(9):
+                    u = j / 8.0
+                    pts.append((x0 + (x1 - x0) * u, y0 + (y1 - y0) * u, z - 8 - 34 * math.sin(u * math.pi)))
+                r.lines(pts, col, 3)
+                if (int(t * 3) + int(x0)) % 7 == 0:
+                    p = pts[int(t * 7) % 9]
+                    r.dot(p[0], p[1], p[2], 3, WHITE, 0.9)
+            elif k == "fan":
+                _, x, y, rad, col = it
+                r.ring(x, y, z - 4, rad, col, 2, 20)
+                for j in range(4):
+                    a = t * 5 + j * TAU / 4
+                    r.line((x, y, z - 4), (x + math.cos(a) * rad * 0.95, y + math.sin(a) * rad * 0.95, z - 4), col, 3)
+            elif k == "garland":
+                _, x0, y0, x1, y1, col = it
+                pts = []
+                for j in range(31):
+                    u = j / 30.0
+                    sag = 24 * abs(math.sin(u * math.pi * 5))
+                    pts.append((x0 + (x1 - x0) * u, y0 + (y1 - y0) * u, z - 6 - sag))
+                r.lines(pts, (40, 140, 70), 3)
+                for j in range(0, 31, 2):
+                    c = ((255, 80, 80), (255, 220, 90), (90, 200, 255), (120, 255, 140))[(j // 2 + int(t * 2)) % 4]
+                    r.dot(pts[j][0], pts[j][1], pts[j][2], 3, c, 0.9)
+            elif k == "ball":
+                _, x, y, rad, col = it
+                r.line((x, y, z), (x, y, z - 40), (180, 180, 190), 1)
+                r.dot(x, y, z - 40 - rad * 0.6, rad * 0.6, col, 0.7)
+                r.ring(x, y, z - 40 - rad * 0.6, rad * 0.6, mix_col(col, WHITE, 0.4), 1, 12)
+            elif k == "banner":
+                _, x, y, wd, ht, col, txt = it
+                for dz in (6, 6):
+                    pass
+                r.poly([(x, y, z - 8), (x + wd, y, z - 8), (x + wd, y, z - 8 - ht), (x, y, z - 8 - ht)], col, WHITE)
+                q = cam.pt(x + wd / 2, y, z - 8 - ht / 2)
+                if q is not None:
+                    self.labels.append((0, txt, int(clamp(18 * q[2] * 2.0, 9, 26)), WHITE, q[0], q[1]))
+            elif k == "pan":
+                _, x, y, rad, col = it
+                r.line((x, y, z), (x, y, z - 50), (120, 120, 130), 1)
+                r.ring(x, y, z - 52, rad, col, 2, 14)
+                r.line((x + rad, y, z - 52), (x + rad + 20, y, z - 52), (110, 80, 56), 3)
+            elif k == "screen3":
+                _, x, y, wd, ht, col = it
+                r.poly([(x - wd / 2, y, z - 20), (x + wd / 2, y, z - 20), (x + wd / 2, y, z - 20 - ht), (x - wd / 2, y, z - 20 - ht)], (6, 10, 18), col)
+                for j in range(4):
+                    ln = wd * (0.2 + 0.7 * (0.5 + 0.5 * math.sin(t * 1.3 + j * 2 + x)))
+                    r.line((x - wd / 2 + 4, y, z - 24 - j * (ht / 5.0)), (x - wd / 2 + 4 + ln, y, z - 24 - j * (ht / 5.0)), col, 2)
+            elif k == "stal":
+                _, x, y, ln, wd, col = it
+                r.poly([(x - wd / 2, y, z), (x + wd / 2, y, z), (x, y, z - ln)], scale_col(col, 0.5), col)
+                r.dot(x, y, z - ln, 2.5, col, 0.4 + 0.4 * math.sin(t * 2 + x))
+            elif k == "chandelier":
+                _, x, y, rad, col = it
+                r.line((x, y, z), (x, y, z - 50), (150, 140, 120), 2)
+                r.ring(x, y, z - 54, rad, col, 3, 18)
+                for j in range(8):
+                    a = j * TAU / 8
+                    fl = 0.7 + 0.3 * math.sin(t * 8 + j * 1.7)
+                    r.dot(x + math.cos(a) * rad, y + math.sin(a) * rad, z - 54, 4, scale_col(col, fl), 1.0)
+            elif k == "bat":
+                _, x, y, rad, col = it
+                fl = math.sin(t * 9 + x) * rad * 0.5
+                r.lines([(x - rad, y, z - 40 + fl), (x - rad * 0.4, y, z - 44), (x, y, z - 42), (x + rad * 0.4, y, z - 44), (x + rad, y, z - 40 + fl)], (150, 120, 190), 3)
+                r.dot(x, y, z - 42, 3, col, 0.5)
+
+
+    def indoor_floor(self, w, cam):
+        """an indoor map: the floor goes right out to the walls"""
+        r = self.r
+        K, walls, roof = self.room(w)
+        o = IN_OFF
+        col = scale_col(w.theme["ground"], 0.7)
+        edge = scale_col(K["trim"], 0.4)
+        for pts in (((-o, -o), (FW + o, -o), (FW + o, 0), (-o, 0)), ((-o, FH), (FW + o, FH), (FW + o, FH + o), (-o, FH + o)),
+                    ((-o, 0), (0, 0), (0, FH), (-o, FH)), ((FW, 0), (FW + o, 0), (FW + o, FH), (FW, FH))):
+            r.poly([(p[0], p[1], 0.0) for p in pts], col, edge)
+        if cam.ortho:
+            r.lines([(-o, -o, 0), (FW + o, -o, 0), (FW + o, FH + o, 0), (-o, FH + o, 0)], scale_col(K["trim"], 0.7), 3, True)
+
+    def hz_block(self, x, y, hx, hy, z0, z1, fill, edge):
+        """a plain box standing on the ground (only the faces that look at the camera are drawn)"""
+        r = self.r
+        cam = r.cam
+        sides = (((x - hx, y - hy), (x + hx, y - hy)), ((x + hx, y - hy), (x + hx, y + hy)), ((x + hx, y + hy), (x - hx, y + hy)), ((x - hx, y + hy), (x - hx, y - hy)))
+        for a, b in sides:
+            mx, my = (a[0] + b[0]) / 2 - x, (a[1] + b[1]) / 2 - y
+            if cam.ortho or mx * (cam.x - x) + my * (cam.y - y) > 0:
+                r.poly([(a[0], a[1], z0), (b[0], b[1], z0), (b[0], b[1], z1), (a[0], a[1], z1)], scale_col(fill, 0.8), edge)
+        r.poly([(x - hx, y - hy, z1), (x + hx, y - hy, z1), (x + hx, y + hy, z1), (x - hx, y + hy, z1)], fill, edge)
+
+    def draw_bf(self, w, cam, t):
+        """the stars you have to destroy, the tower Desolation has locked on to, and the blow that is about to land"""
+        bf = w.bf
+        r = self.r
+        boss = next((e for e in w.enemies if e.kind in ("desolation", "scarecrow") and not e.dead), None)
+        gold = (255, 230, 90)
+        for st in bf.get("stars", ()):
+            x, y = st["x"], st["y"]
+            z0 = (w.top(x, y) if (w.maxh + w.maxroad > 0) else 0.0) + 0.8
+            f = clamp(st["life"] / BF_STAR_LIFE, 0.0, 1.0)
+            hurry = f < 0.3 and int(t * 6) % 2 == 0
+            c = RED if hurry else gold
+            r.ring(x, y, z0, BF_STAR_R, c, 3, 30)
+            r.ring(x, y, z0, BF_STAR_R + 9, scale_col(c, 0.4), 1, 30)
+            n = max(2, int(36 * f))
+            r.lines([(x + math.cos(-math.pi / 2 + TAU * f * i / n) * (BF_STAR_R + 9), y + math.sin(-math.pi / 2 + TAU * f * i / n) * (BF_STAR_R + 9), z0 + 0.5) for i in range(n + 1)], c, 3)
+            pg = clamp(st["prog"] / BF_STAR_WORK, 0.0, 1.0)
+            if pg > 0.02:
+                n = max(2, int(36 * pg))
+                r.lines([(x + math.cos(-math.pi / 2 + TAU * pg * i / n) * (BF_STAR_R - 8), y + math.sin(-math.pi / 2 + TAU * pg * i / n) * (BF_STAR_R - 8), z0 + 0.6) for i in range(n + 1)], (120, 255, 150), 4)
+            zc = z0 + 34 + math.sin(t * 2.4 + st["id"]) * 4
+            pts = []
+            for i in range(10):
+                a = t * 1.4 + i * TAU / 10
+                rr = 17 if i % 2 == 0 else 7
+                pts.append((x + math.cos(a) * rr, y + math.sin(a) * rr, zc))
+            r.lines(pts, c, 3, True)
+            pts2 = []
+            for i in range(10):
+                a = t * 1.4 + i * TAU / 10
+                rr = 17 if i % 2 == 0 else 7
+                pts2.append((x + math.cos(a) * rr * 0.55, y + math.sin(a) * rr * 0.55, zc + 3))
+            r.lines(pts2, WHITE, 2, True)
+            r.line((x, y, z0), (x, y, zc - 10), scale_col(c, 0.5), 2)
+            r.glow(x, y, zc, 30, c, 0.8 if not hurry else 1.0)
+            if boss is not None:
+                r.line((x, y, zc), (boss.x, boss.y, boss.z + 70), scale_col(c, 0.28), 1)
+            q = cam.pt(x, y, zc + 24)
+            if q is not None:
+                self.labels.append((0, "%d" % math.ceil(st["life"]), 20, c, q[0], q[1]))
+        for tid, tl in bf.get("lock", ()):
+            tw = next((q for q in w.towers if q.id == tid), None)
+            if tw is None:
+                continue
+            u = clamp(tl / 1.5, 0.0, 1.0)
+            z0 = tw.z + 1.0
+            blink = 0.55 + 0.45 * math.sin(t * 22)
+            c = scale_col((255, 50, 50), blink)
+            r.ring(tw.x, tw.y, z0, 14 + 34 * u, c, 3, 22)
+            r.ring(tw.x, tw.y, z0, 14, c, 2, 16)
+            for k in range(4):
+                a = k * math.pi / 2 + math.pi / 4
+                r.line((tw.x + math.cos(a) * 10, tw.y + math.sin(a) * 10, z0), (tw.x + math.cos(a) * (28 + 20 * u), tw.y + math.sin(a) * (28 + 20 * u), z0), c, 2)
+            if boss is not None:
+                r.line((boss.x, boss.y, boss.z + 50), (tw.x, tw.y, tw.z + 14), scale_col((255, 50, 50), 0.55 * blink), 2)
+            q = cam.pt(tw.x, tw.y, tw.z + 40)
+            if q is not None:
+                self.labels.append((0, "LOCKED", 15, c, q[0], q[1]))
+        sl = bf.get("slam")
+        if sl:
+            u = 1.0 - clamp(sl[2] / 1.4, 0.0, 1.0)
+            blink = 0.6 + 0.4 * math.sin(t * 18)
+            z0 = (w.top(sl[0], sl[1]) if (w.maxh + w.maxroad > 0) else 0.0) + 0.8
+            r.ring(sl[0], sl[1], z0, 165, scale_col((255, 60, 60), blink), 3, 40)
+            r.ring(sl[0], sl[1], z0, 82, scale_col((255, 200, 90), blink), 3, 28)
+            r.ring(sl[0], sl[1], z0, 165 * (1.0 - u * 0.9), WHITE, 2, 36)
+            q = cam.pt(sl[0], sl[1], z0 + 30)
+            if q is not None:
+                self.labels.append((0, "SLAM  %.1f" % max(0.0, sl[2]), 18, (255, 120, 90), q[0], q[1] - 40))
+
+    def draw_hazards(self, w, cam, t):
+        """the warnings and the blows of the level's hazards, and the railgun that stands at the edge of some maps"""
+        theme = w.map.get("theme")
+        L = HAZ.get(theme)
+        if not L:
+            return
+        r = self.r
+        hz = getattr(w, "hz", None) or []
+        aim = {}
+        for h in hz:
+            H = hz_def(theme, h["i"])
+            if H is not None and H["arch"] == "beam":
+                aim = dict(h=h, H=H)
+        if any(H["arch"] == "beam" for H in L):
+            gx, gy = HZ_GUN
+            col = (L[[H["arch"] for H in L].index("beam")])["col"]
+            self.hz_block(gx, gy, 18, 18, 0, 14, (28, 30, 52), scale_col(col, 0.8))
+            self.hz_block(gx, gy, 11, 11, 14, 32, (36, 40, 70), col)
+            ang = aim["h"]["ang"] if aim else math.atan2(FH / 2 - gy, FW / 2 - gx)
+            ca, sa = math.cos(ang), math.sin(ang)
+            hot = 0.0
+            if aim:
+                H, h = aim["H"], aim["h"]
+                hot = clamp(h["t"] / H["warn"], 0.0, 1.0) if h["t"] < H["warn"] else clamp(1 - (h["t"] - H["warn"]) / max(0.1, H["dur"]), 0.0, 1.0)
+            r.line((gx, gy, 30), (gx + ca * 54, gy + sa * 54, 30), mix_col(col, WHITE, hot), 8)
+            r.line((gx, gy, 30), (gx + ca * 54, gy + sa * 54, 30), (20, 22, 40), 3)
+            r.dot(gx + ca * 56, gy + sa * 56, 30, 4 + 6 * hot, mix_col(col, WHITE, hot), hot)
+        for h in hz:
+            H = hz_def(theme, h["i"])
+            if H is None:
+                continue
+            col, tt, warn = H["col"], h["t"], H["warn"]
+            u = clamp(tt / warn, 0.0, 1.0)
+            blink = 0.6 + 0.4 * math.sin(tt * (8 + 12 * u))
+            c = scale_col(col, 0.55 + 0.45 * blink)
+            if H["arch"] == "strike":
+                x, y, rad = h["x"], h["y"], H["rad"]
+                z0 = (w.top(x, y) if (w.maxh + w.maxroad > 0) else 0.0) + 0.8
+                if tt < warn:
+                    if H["sq"]:
+                        r.lines([(x - rad, y - rad, z0), (x + rad, y - rad, z0), (x + rad, y + rad, z0), (x - rad, y + rad, z0)], c, 3, True)
+                        s2 = rad * (1 - u)
+                        r.lines([(x - s2, y - s2, z0), (x + s2, y - s2, z0), (x + s2, y + s2, z0), (x - s2, y + s2, z0)], mix_col(col, WHITE, u * 0.6), 2, True)
+                    else:
+                        r.ring(x, y, z0, rad, c, 3, 30)
+                        r.ring(x, y, z0, max(6.0, rad * (1 - u)), mix_col(col, WHITE, u * 0.6), 2, 24)
+                    for k in range(4):
+                        a = tt * 2.0 + k * TAU / 4
+                        r.line((x + math.cos(a) * rad * 0.2, y + math.sin(a) * rad * 0.2, z0), (x + math.cos(a) * rad * 0.9, y + math.sin(a) * rad * 0.9, z0), c, 2)
+                    r.dot(x, y, z0, 4 + 4 * u, mix_col(col, WHITE, u), u * 0.8)
+                    q = cam.pt(x, y, z0 + 8)
+                    if q is not None:
+                        self.labels.append((0, "%s  %.1f" % (H["name"], max(0.0, warn - tt)), 15, mix_col(col, WHITE, 0.3), q[0], q[1] - 16))
+                else:
+                    f = 1 - (tt - warn) / max(0.1, H["dur"] + 0.3)
+                    if f > 0:
+                        r.ring(x, y, z0, rad * (1.0 + 0.2 * (1 - f)), scale_col(mix_col(col, WHITE, 0.5), f), 3, 28)
+            elif H["arch"] == "beam":
+                a0, b0 = hz_line(h)
+                ca, sa = math.cos(h["ang"]), math.sin(h["ang"])
+                hw = H["rad"] * 0.5
+                nx, ny = -sa * hw, ca * hw
+                if tt < warn:
+                    for sg in (1, -1):
+                        r.line((a0[0] + nx * sg + ca * 70, a0[1] + ny * sg + sa * 70, 1.5), (a0[0] + nx * sg + ca * 1500, a0[1] + ny * sg + sa * 1500, 1.5), c, 2)
+                    d = 70.0 + (tt * 260) % 40
+                    while d < 1500:
+                        r.line((a0[0] + ca * d, a0[1] + sa * d, 1.5), (a0[0] + ca * (d + 16), a0[1] + sa * (d + 16), 1.5), mix_col(col, WHITE, u * 0.7), 3)
+                        d += 40
+                    q = cam.pt(FW * 0.5 * 0 + a0[0] + ca * 160, a0[1] + sa * 160, 20)
+                    if q is not None:
+                        self.labels.append((0, "%s  %.1f" % (H["name"], max(0.0, warn - tt)), 15, mix_col(col, WHITE, 0.3), q[0], q[1] - 18))
+                else:
+                    f = clamp(1 - (tt - warn) / max(0.1, H["dur"]), 0.0, 1.0)
+                    if f > 0:
+                        r.line((a0[0], a0[1], 24), (a0[0] + ca * 1500, a0[1] + sa * 1500, 24), scale_col(col, 0.4 + 0.6 * f), int(16 * f) + 3)
+                        r.line((a0[0], a0[1], 24), (a0[0] + ca * 1500, a0[1] + sa * 1500, 24), WHITE, int(6 * f) + 1)
+            else:
+                horiz = abs(math.cos(h["ang"])) > 0.5
+                half = H["rad"] * 0.5
+                span = (FW if horiz else FH) + 2 * H["rad"]
+                fwd = (math.cos(h["ang"]) if horiz else math.sin(h["ang"])) > 0
+                if tt < warn:
+                    p = (0.0 if fwd else (FW if horiz else FH))
+                else:
+                    horiz, p = hz_band(h, H)
+                lo, hi = p - half, p + half
+                cross = FH if horiz else FW
+                z1 = 3.0
+                def pt(a, b):
+                    return (a, b, z1) if horiz else (b, a, z1)
+                if tt < warn:
+                    r.line(pt(p, -20), pt(p, cross + 20), c, 4)
+                    for k in range(5):
+                        cc = (k + 0.5) / 5 * cross
+                        dd = ((tt * 90) % 40) * (1 if fwd else -1)
+                        for j in range(3):
+                            o = p + (j * 28 + dd) * (1 if fwd else -1)
+                            r.lines([pt(o - (8 if fwd else -8), cc - 10), pt(o, cc), pt(o - (8 if fwd else -8), cc + 10)], scale_col(col, 0.4 + 0.6 * blink), 2)
+                    xy = pt(p, cross * 0.5)
+                    q = cam.pt(xy[0], xy[1], 20)
+                    if q is not None:
+                        self.labels.append((0, "%s  %.1f" % (H["name"], max(0.0, warn - tt)), 16, mix_col(col, WHITE, 0.3), q[0], q[1] - 16))
+                else:
+                    for e in (lo, hi):
+                        r.line(pt(e, -20), pt(e, cross + 20), scale_col(col, 0.9), 3)
+                    lead = hi if fwd else lo
+                    r.line(pt(lead, -20), pt(lead, cross + 20), WHITE, 2)
+                    for k in range(int(H["rad"] // 18) + 1):
+                        o = lo + k * 18 + (t * 40) % 18
+                        if o < hi:
+                            r.line(pt(o, 0), pt(o + 22, cross), scale_col(col, 0.35), 1)
     def flat_fx(self, kind, ob, z, t):
         r = self.r
         if kind == 0:
@@ -8660,6 +9912,28 @@ class Scene:
             for i in range(3):
                 a = t * 7 + i * 2.1
                 r.dot(tw.x + math.cos(a) * 12, tw.y + math.sin(a) * 12, tw.z + 18 + math.sin(a * 1.7) * 6, 1.6, PURPLE)
+        if tw.ruin:
+            for i in range(4):
+                u = (t * 0.6 + i * 0.25) % 1.0
+                r.dot(tw.x + math.sin(i * 2.3 + t) * 5, tw.y + math.cos(i * 1.7) * 5, tw.z + 8 + u * 26, 3.0 * (1 - u) + 1, (70, 66, 74))
+            xx, yy, zz = tw.x, tw.y, tw.z + 12
+            r.lines([(xx - 9, yy, zz - 9), (xx + 9, yy, zz + 9)], (255, 50, 60), 3)
+            r.lines([(xx - 9, yy, zz + 9), (xx + 9, yy, zz - 9)], (255, 50, 60), 3)
+        elif tw.maxd > 0 and not tw.path:
+            for i in range(tw.maxd):
+                r.dot(tw.x + (i - (tw.maxd - 1) / 2.0) * 5.5, tw.y, top + 7, 1.9, (255, 70, 80) if i >= tw.deaths else (60, 40, 46))
+        if tw.kind not in SUPPORT_KINDS and tw.stun <= 0:
+            bf = w.rate_buff(tw)
+            if bf > 0:
+                # a Commander is buffing it: little red chevrons rise over it
+                for i in range(2):
+                    u = (t * 1.3 + i * 0.5) % 1.0
+                    zz = tw.z + m.top + 4 + u * 10
+                    xx, yy = tw.x, tw.y
+                    r.lines([(xx - 4, yy, zz), (xx, yy, zz + 4), (xx + 4, yy, zz)], scale_col(RED, 1.0 - u * 0.7), 2)
+            if tw.rb > 0:
+                zz = tw.z + m.top + 6 + math.sin(t * 3 + tw.id) * 1.5
+                r.ring(tw.x, tw.y, zz, 3.5, CYAN, 1, 6)
         if tw.act > 0:
             self.tring(w, tw.x, tw.y, tw.rng * (0.96 + 0.04 * math.sin(t * 8)), RED, 2)
         if tw.od > 0:
@@ -8729,6 +10003,9 @@ class Scene:
         z = e.z
         if e.lift > 0:
             z += 16 * min(1.0, e.lift * 3)
+        if e.air:
+            r.ring(e.x, e.y, e.z + 0.5, e.r * 0.9, (20, 26, 40), 2, 12)         # its shadow on the ground
+            z += AIR_H + math.sin(e.t * 2.2 + e.id) * 2.5
         q = cam.pt(e.x, e.y, z)
         if q is None or not (-60 < q[0] < W + 60 and -100 < q[1] < H + 60):
             return
@@ -8800,10 +10077,10 @@ class Scene:
         f = clamp(g.hp / max(1.0, g.max), 0, 1)
         if cam.ortho:
             # the flat view: a small gold diamond
-            rr = max(4.0, g.r * k * 0.85)
+            rr = max(4.0, g.r * k * (0.85 if g.lv < KING_LV else 1.0))
             x, y = q[0], q[1]
             pts = [(x, y - rr), (x + rr, y), (x, y + rr), (x - rr, y)]
-            pygame.draw.polygon(s, WHITE if g.flash > 0 else GOLD, pts)
+            pygame.draw.polygon(s, WHITE if g.flash > 0 else (GOON_ROLE_COL[g.role] if g.role else GOLD), pts)
             pygame.draw.polygon(s, (60, 40, 8), pts, 1)
             self.labels.append((4, x, y - rr - 7, max(14, int(g.r * 2.4 * k)), 3, f))
             return
@@ -8813,11 +10090,35 @@ class Scene:
             return
         m = goon_model(g.lv, k < FAR_K)
         col = g.owner.tcol("summoner") if g.owner is not None else TOWERS["summoner"]["col"]
-        if g.flash > 0:
+        if g.lv >= KING_LV:
+            r.model(m, palette(col, m.fixed, g.flash > 0), g.x, g.y, g.z, g.ang, g.t, KING_SC, 0.0, k > 0.5, -g.d * WALK_K)
+            r.ring(g.x, g.y, g.z + 0.6, g.r + 3, GOLD, 2, 14)
+            b = cam.pt(g.x, g.y, g.z + (m.top + 4) * KING_SC)
+            if b is not None:
+                self.labels.append((4, b[0], b[1] - 2, max(24, min(110, int(g.r * 2.6 * k))), 5, f))
+                self.labels.append((0, "KING  " + hp_text(g.hp), 15, GOLD, b[0], b[1] - 13))
+            return
+        if g.role == 1:
+            r.model(m, palette(col, m.fixed, g.flash > 0), g.x, g.y, g.z, g.ang, g.t, 1.25, 0.0, k > 0.5, -g.d * WALK_K)
+            sh = cam.pt(g.x, g.y, g.z + 9)
+            if sh is not None:
+                pygame.draw.circle(r.s, GOON_ROLE_COL[1], (sh[0], sh[1]), max(2, int(5 * sh[2])), 2)
+        elif g.role:
+            sc = 0.85 if g.role == 2 else 0.95
+            r.model(m, palette(col, m.fixed, g.flash > 0), g.x, g.y, g.z, g.ang, g.t, sc, 0.0, k > 0.5, -g.d * WALK_K)
+            hd = cam.pt(g.x, g.y, g.z + m.top * sc + 5)
+            if hd is not None:
+                rr = max(2, int(3 * hd[2]))
+                if g.role == 3:
+                    pygame.draw.line(r.s, GOON_ROLE_COL[3], (hd[0] - rr, hd[1]), (hd[0] + rr, hd[1]), 2)
+                    pygame.draw.line(r.s, GOON_ROLE_COL[3], (hd[0], hd[1] - rr), (hd[0], hd[1] + rr), 2)
+                else:
+                    pygame.draw.polygon(r.s, GOON_ROLE_COL[2], [(hd[0], hd[1] - rr), (hd[0] + rr, hd[1] + rr), (hd[0] - rr, hd[1] + rr)])
+        elif g.flash > 0:
             r.walker(m, palette(col, m.fixed, True), g.x, g.y, g.z, g.ang, g.t, k > 0.5, -g.d * WALK_K, clamp(1.0 - g.flash / 0.1, 0.0, 1.0))
         else:
             r.walker(m, palette(col, m.fixed), g.x, g.y, g.z, g.ang, g.t, k > 0.5, -g.d * WALK_K)
-        r.ring(g.x, g.y, g.z + 0.6, g.r + 1, GOLD, 1, 10)
+        r.ring(g.x, g.y, g.z + 0.6, g.r + 1, GOON_ROLE_COL[g.role] if g.role else GOLD, 1, 10)
         b = cam.pt(g.x, g.y, g.z + m.top + 4)
         if b is not None:
             self.labels.append((4, b[0], b[1] - 2, max(14, min(70, int(g.r * 2.6 * k))), 4, f))
@@ -8849,7 +10150,8 @@ class Scene:
             y += math.sin(ang + math.pi / 2) * wob * 3.0
         else:
             a = ang + u * 1.1
-        r.model(m, pal, x, y, z - u * u * rad * 0.6, a, age * 2.0, 1.0 - 0.45 * u, 0, k > 0.5, walk)
+        big = KING_SC if (isinstance(name, tuple) and name[1] >= KING_LV) else 1.0
+        r.model(m, pal, x, y, z - u * u * rad * 0.6, a, age * 2.0, (1.0 - 0.45 * u) * big, 0, k > 0.5, walk)
 
     def draw_npc(self, n, t, o):
         r = self.r
@@ -8859,6 +10161,12 @@ class Scene:
         if me is not None:
             ang = math.atan2(me[1] - n["y"], me[0] - n["x"])
         r.model(m, palette(n["col"], m.fixed), n["x"], n["y"], n["z"], ang, t + hash(n["id"]) % 7)
+        if n["hat"] == "shadow":
+            for i in range(5):
+                a = t * 1.7 + i * 1.26
+                u = (t * 0.6 + i * 0.2) % 1.0
+                r.dot(n["x"] + math.cos(a) * (7 + u * 6), n["y"] + math.sin(a) * (7 + u * 6), n["z"] + 4 + u * 34, 1.8, (120, 20, 40), 1.0 - u)
+            r.ring(n["x"], n["y"], n["z"] + 0.6, 14 + math.sin(t * 2.4) * 2, (150, 20, 40), 1, 14)
         q = r.cam.pt(n["x"], n["y"], n["z"] + 36)
         if q is not None and 0 < q[0] < W and 0 < q[1] < H:
             if o.get("names", True):
@@ -9181,6 +10489,10 @@ class Player:
         self.cash = 0.0
         self.cfrac = 0.0
         self.acd = [0.0, 0.0]
+        self.kings = 0          # Kings of the Goons sent so far (each one costs more)
+        self.ocd = 0.0          # orb shot: seconds until the next one
+        self.dcd = 0.0          # dash: seconds until it is ready
+        self.vs_inc = 0.0       # versus: extra cash at the end of every wave, earned by sending enemies
         self.cards = []
         self.offer = None
         self.ready = False
@@ -9236,6 +10548,11 @@ class Tower:
         self.db = 0.0           # damage bonus from a Beacon with SPOTTER
         self.cmds = []
         self.mechs = []
+        self.rbuf = 0.0         # fire-rate buff from a Commander (a Wi-Fi guest gets it from the host)
+        self.deaths = 0         # times a boss has killed it (Blood Factory)
+        self.maxd = 0           # ...and how many it can take before it cannot be repaired
+        self.ruin = False
+        self.wreck = False      # knocked out by a level hazard (a Mechanic close by gets it going again faster)
         self.ramp = 0.0
         self.beam = False
         self.acd = 0.0          # ability cooldown left
@@ -9261,10 +10578,14 @@ class Tower:
 class Enemy:
     __slots__ = ("id", "kind", "pi", "d", "rem", "x", "y", "ang", "hp", "max", "spd", "cur", "armor", "r", "col", "bounty", "leak", "boss",
                  "shield", "smax", "sreg", "slow", "slow_t", "freeze", "burn", "burn_t", "burn_p", "flash", "t", "a1", "a2", "stage",
-                 "dead", "hidden", "dr", "haste", "hmul", "hm", "name", "ai", "model", "atk", "block", "fear", "lift", "chill", "vuln", "fcd", "z", "tick", "act")
+                 "dead", "hidden", "dr", "haste", "hmul", "hm", "name", "ai", "model", "atk", "block", "fear", "lift", "chill", "vuln", "fcd", "z", "tick", "act",
+                 "air", "ax", "ay", "ux", "uy", "alen", "b1", "b2", "b3")
 
     def __init__(self, eid, kind, pi, d, hm, bounty, t0=0.0):
         e = ENEMIES[kind]
+        self.b1 = self.b2 = self.b3 = 0.0   # (the Blood Factory bosses keep their clocks here)
+        self.air = bool(e.get("air"))      # a flyer: it ignores the road (d is how far it has flown, alen how far it has to go)
+        self.ax = self.ay = self.ux = self.uy = self.alen = 0.0
         self.z = 0.0             # how high the road is where it walks
         self.tick = 0.0          # steady damage (beams, auras) saved up towards its next $1 of hit cash
         self.act = 0.0           # seconds left of the attack swing it is playing (only for looks)
@@ -9309,11 +10630,24 @@ class Enemy:
         self.fcd = 0.0
 
 
+def air_setup(e, p):
+    """a flyer's straight line: from where its road starts to where its road ends (a little to the side, so a flock spreads out)"""
+    ax, ay = p.pts[0]
+    bx, by = p.pts[-1]
+    dx, dy = bx - ax, by - ay
+    L = math.hypot(dx, dy) or 1.0
+    e.ux, e.uy = dx / L, dy / L
+    off = ((e.id * 37) % 9 - 4) * 5.0
+    e.ax, e.ay = ax - e.uy * off, ay + e.ux * off
+    e.alen = L
+    e.ang = math.atan2(e.uy, e.ux)
+
+
 class Goon:
     """a Summoner's little soldier: it walks from the core up the road, towards the gate, and trades health with the enemies it meets"""
-    __slots__ = ("id", "tw", "tid", "owner", "pi", "d", "x", "y", "z", "ang", "hp", "max", "spd", "lv", "r", "flash", "t", "dead")
+    __slots__ = ("id", "tw", "tid", "owner", "pi", "d", "x", "y", "z", "ang", "hp", "max", "spd", "lv", "r", "flash", "t", "dead", "role", "cd", "sd")
 
-    def __init__(self, gid, tw, owner, pi, d, hp, spd, lv=0):
+    def __init__(self, gid, tw, owner, pi, d, hp, spd, lv=0, role=0):
         self.id = gid
         self.tw = tw             # the Summoner it belongs to (None on a Wi-Fi guest's copy)
         self.tid = tw.id if tw is not None else 0
@@ -9326,7 +10660,12 @@ class Goon:
         self.max = self.hp = float(hp)
         self.spd = spd
         self.lv = lv
-        self.r = GOON_R
+        self.role = role         # 0 soldier, 1 shield-bearer, 2 archer, 3 healer
+        self.r = KING_R if lv >= KING_LV else GOON_R * (1.25 if role == 1 else 1.0)
+        self.cd = 0.0
+        self.sd = 0.0            # (a saw) how hard it cuts
+        if role == 4:
+            self.r = GOON_R * 1.5
         self.flash = 0.0
         self.t = 0.0
         self.dead = False
@@ -9361,11 +10700,37 @@ class Shot:
         self.spd = 640.0
 
 
+class OrbSrc:
+    """what an orb's shots count as (a tower stands in that place for the damage code): it never pays hit cash"""
+    kind = "blaster"
+    mb = None
+    tp = None
+    nopay = True
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.kills = 0
+        self.dealt = 0.0
+
+
 ORB_R = 9.0             # how big a player's orb is when it bumps into things
 _field_count = [0]
 
 
 class Field:
+    vs = None                   # a versus match: {"i": my number, "info": [...]}.  None in an ordinary match
+
+    def path_open(self, pi):
+        """is this road in use?  (the Blood Factory keeps its second gate shut until wave 16)"""
+        op = self.map.get("open")
+        if not op or pi not in op:
+            return True
+        return self.wave + (1 if self.phase == "build" else 0) >= op[pi]
+
+    def team(self):
+        """with friends, or in a versus match, the next wave starts by itself"""
+        return len(self.players) > 1 or self.vs is not None
+
     def __init__(self, mapkey, fx=True):
         m = MAP_BY_ID[mapkey] if isinstance(mapkey, str) else MAPS[mapkey]
         _field_count[0] += 1
@@ -9715,8 +11080,10 @@ class Field:
             return "Only %d Harvesters allowed" % HARVESTER_MAX
         if kind == "stonks" and self.count(P, kind) >= STONKS_MAX:
             return "Only %d Stonks allowed" % STONKS_MAX
+        if kind == "chainsaw" and self.count(P, kind) >= CHAINSAW_MAX:
+            return "Only %d Chainsaws allowed" % CHAINSAW_MAX
         if kind == "summoner" and self.count(P, kind) >= SUMMONER_MAX:
-            return "Only %d Summoners allowed" % SUMMONER_MAX
+            return "Only %d Summoner allowed" % SUMMONER_MAX
         if is_path(kind) and sum(1 for t in self.towers + self.plans if t.path and t.owner is P) >= PATH_MAX:
             return "Only %d path towers allowed" % PATH_MAX
         return ""
@@ -9737,7 +11104,7 @@ class Field:
 
     def wave_in(self):
         """with friends the next wave starts by itself: how many seconds until it does (0 when it is not counting down)"""
-        if self.phase != "build" or len(self.players) < 2:
+        if self.phase != "build" or not self.team():
             return 0.0
         return max(0.0, MP_WAVE_DELAY - self.build_t)
 
@@ -9947,6 +11314,151 @@ class Field:
             lf = life * rnd.uniform(0.5, 1.0)
             self.parts.append([x, y, z, math.cos(a) * v, math.sin(a) * v, rnd.uniform(0.1, 0.9) * spd, lf, lf, col, size])
 
+    # ---- spectacle: one call = a whole little show of sparks, smoke, embers and rings (made on every screen from one small message)
+    def _sp(self, x, y, z, vx, vy, vz, life, col, size, g=1.0, style=0):
+        if len(self.parts) < 950:
+            self.parts.append([x, y, z, vx, vy, vz, life, life, col, size, g, style])
+
+    def fx_k(self, kind, x, y, col=WHITE, z=10.0, sc=1.0, ang=None, lift=True):
+        """kinds: muzzle, hit, crit, death, bigdeath, bossdeath, slam, charge, boom, and the ability looks: fire, ice, shock, heal, void, gold, emp, warn"""
+        if lift and self.maxh + self.maxroad > 0:
+            z += self.top(x, y)
+        if self.net:
+            self.fxlog.append(["k", kind, int(x), int(y), tuple(col)[:3], int(z), round(sc, 2), None if ang is None else round(ang, 2)])
+        if not self.fx or len(self.parts) > 900:
+            return
+        R = self.frnd
+        sp = self._sp
+        was = self.net
+        self.net = False
+        try:
+            w3 = mix_col(col, WHITE, 0.6)
+            if kind == "muzzle":
+                a0 = ang if ang is not None else R.uniform(0, TAU)
+                for _ in range(3):
+                    a = a0 + R.uniform(-0.35, 0.35)
+                    v = R.uniform(120, 260)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(-10, 40), R.uniform(0.12, 0.25), w3, 2, 0.2, 1)
+                glow_k = 0
+            elif kind == "hit":
+                for _ in range(4):
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(60, 190)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(30, 150), R.uniform(0.15, 0.32), col, 2, 0.8, 1)
+            elif kind == "crit":
+                for i in range(14):
+                    a = i * TAU / 14 + R.uniform(-0.1, 0.1)
+                    v = R.uniform(150, 280)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(10, 90), R.uniform(0.2, 0.4), GOLD if i % 2 else WHITE, 2, 0.3, 1)
+                self.rings.append([x, y, z - 8, 4, 22 * sc, 0.25, 0.25, GOLD, 2])
+            elif kind in ("death", "bigdeath", "bossdeath"):
+                n = {"death": 10, "bigdeath": 22, "bossdeath": 70}[kind] * min(2.0, max(0.7, sc))
+                for _ in range(int(n)):                          # shards of the body
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(40, 150 + 120 * sc)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(60, 220), R.uniform(0.5, 1.0), col, 3 if kind == "death" else 4, 1.0, 0)
+                for _ in range(int(n * 0.9)):                    # hot sparks
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(90, 300 + 150 * sc)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(20, 200), R.uniform(0.25, 0.6), w3, 2, 0.5, 1)
+                for _ in range(max(2, int(n * 0.25))):           # smoke that hangs about
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(10, 60)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(15, 55), R.uniform(0.7, 1.3), mix_col(col, (70, 70, 85), 0.6), 5 + 3 * sc, -0.05, 2)
+                for _ in range(max(3, int(n * 0.3))):            # embers drifting up
+                    sp(x + R.uniform(-8, 8), y + R.uniform(-8, 8), z, R.uniform(-25, 25), R.uniform(-25, 25), R.uniform(40, 110), R.uniform(0.8, 1.5), col, 2, -0.1, 3)
+                self.rings.append([x, y, max(1.0, z - 8), 4, 24 + 16 * sc, 0.3, 0.3, w3, 2])
+                if kind == "bossdeath":
+                    for q in range(3):
+                        self.rings.append([x, y, max(1.0, z - 8), 8, 110 + q * 55, 0.55 + q * 0.18, 0.55 + q * 0.18, col, 3])
+                    for i in range(26):                          # a pillar of light-sparks
+                        sp(x + R.uniform(-10, 10), y + R.uniform(-10, 10), z, R.uniform(-30, 30), R.uniform(-30, 30), R.uniform(160, 420), R.uniform(0.8, 1.6), w3, 3, -0.15, 3)
+                    for i in range(18):                          # a ring of dust racing out
+                        a = i * TAU / 18
+                        sp(x, y, 4, math.cos(a) * 230, math.sin(a) * 230, 6, 0.9, (150, 150, 170), 7, 0.0, 2)
+            elif kind == "slam":
+                for i in range(22):
+                    a = i * TAU / 22
+                    sp(x, y, 4, math.cos(a) * (170 + 30 * sc), math.sin(a) * (170 + 30 * sc), 8, 0.8, mix_col(col, (120, 110, 100), 0.5), 6, 0.0, 2)
+                for _ in range(16):
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(60, 200)
+                    sp(x, y, 4, math.cos(a) * v, math.sin(a) * v, R.uniform(140, 330), R.uniform(0.5, 1.0), col, 3, 1.0, 0)
+                self.rings.append([x, y, 2, 6, 90 * sc + 40, 0.45, 0.45, col, 4])
+            elif kind == "charge":
+                for _ in range(12):                              # sparks sucked into the middle
+                    a = R.uniform(0, TAU)
+                    rr = R.uniform(40, 90) * sc
+                    sp(x + math.cos(a) * rr, y + math.sin(a) * rr, z + R.uniform(0, 20), -math.cos(a) * rr * 2.6, -math.sin(a) * rr * 2.6, 0, 0.38, w3, 2, 0.0, 1)
+            elif kind == "boom":
+                n = int(14 * sc)
+                for _ in range(n):
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(80, 260) * (0.7 + 0.3 * sc)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(40, 240), R.uniform(0.3, 0.7), w3 if R.random() < 0.5 else col, 2, 0.6, 1)
+                for _ in range(int(n * 0.4)):
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(10, 80)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(20, 70), R.uniform(0.6, 1.1), (90, 85, 95), 5 + 2 * sc, -0.05, 2)
+            elif kind == "fire":                                 # fire: a swirl of embers and rolling smoke
+                for i in range(int(28 * sc)):
+                    a = R.uniform(0, TAU)
+                    rr = R.uniform(0, 1) * 60 * sc
+                    sp(x + math.cos(a) * rr, y + math.sin(a) * rr, z, R.uniform(-25, 25), R.uniform(-25, 25), R.uniform(70, 230), R.uniform(0.6, 1.2), mix_col(ORANGE, (255, 210, 90), R.random()), 3, -0.15, 3)
+                for i in range(int(8 * sc)):
+                    a = R.uniform(0, TAU)
+                    rr = R.uniform(0, 1) * 50 * sc
+                    sp(x + math.cos(a) * rr, y + math.sin(a) * rr, z, 0, 0, R.uniform(40, 90), R.uniform(0.9, 1.5), (80, 70, 75), 6, -0.1, 2)
+            elif kind == "ice":                                  # ice: shards fly up and tumble down like snow
+                for i in range(int(30 * sc)):
+                    a = R.uniform(0, TAU)
+                    rr = R.uniform(0, 1) * 70 * sc
+                    sp(x + math.cos(a) * rr, y + math.sin(a) * rr, z + R.uniform(0, 30), R.uniform(-30, 30), R.uniform(-30, 30), R.uniform(60, 190), R.uniform(0.7, 1.4), (210, 240, 255) if i % 2 else col, 3, 0.35, 0)
+                for i in range(int(14 * sc)):
+                    a = i * TAU / (14 * sc)
+                    sp(x, y, 5, math.cos(a) * 160, math.sin(a) * 160, 10, 0.5, w3, 2, 0.0, 1)
+            elif kind == "shock":                                # lightning: crackling arcs
+                for i in range(int(6 * sc) + 3):
+                    a = R.uniform(0, TAU)
+                    ln = R.uniform(30, 80) * sc
+                    pts = [(x, y, z)]
+                    for j in range(1, 4):
+                        pts.append((x + math.cos(a + R.uniform(-0.5, 0.5)) * ln * j / 3.0, y + math.sin(a + R.uniform(-0.5, 0.5)) * ln * j / 3.0, z + R.uniform(-4, 10)))
+                    self.bolts.append([pts, 0.2, 0.2, w3, 2])
+                for _ in range(int(14 * sc)):
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(80, 260)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(20, 100), R.uniform(0.2, 0.5), (190, 230, 255), 2, 0.4, 1)
+            elif kind == "heal":                                 # healing: soft green motes rising
+                for i in range(int(22 * sc)):
+                    a = R.uniform(0, TAU)
+                    rr = R.uniform(0, 1) * 70 * sc
+                    sp(x + math.cos(a) * rr, y + math.sin(a) * rr, z, 0, 0, R.uniform(30, 100), R.uniform(0.9, 1.6), (120, 255, 170) if i % 3 else WHITE, 3, -0.1, 3)
+            elif kind == "void":                                 # void: dark swirl pulled into the middle
+                for i in range(int(26 * sc)):
+                    a = R.uniform(0, TAU)
+                    rr = R.uniform(0.4, 1.0) * 80 * sc
+                    sp(x + math.cos(a) * rr, y + math.sin(a) * rr, z + R.uniform(0, 20), -math.cos(a + 1.2) * rr * 1.8, -math.sin(a + 1.2) * rr * 1.8, 0, 0.5, (170, 90, 255) if i % 2 else (90, 40, 160), 3, 0.0, 3)
+            elif kind == "gold":                                 # glory: golden sparks fall like rain
+                for i in range(int(30 * sc)):
+                    a = R.uniform(0, TAU)
+                    rr = R.uniform(0, 1) * 80 * sc
+                    sp(x + math.cos(a) * rr, y + math.sin(a) * rr, z + R.uniform(40, 120), R.uniform(-15, 15), R.uniform(-15, 15), R.uniform(-60, 30), R.uniform(0.7, 1.3), GOLD if i % 2 else WHITE, 3, 0.4, 1)
+            elif kind == "emp":                                  # EMP: rings and crackle
+                for q in range(3):
+                    self.rings.append([x, y, max(1.0, z - 8), 8, 70 * sc + q * 30, 0.4 + q * 0.12, 0.4 + q * 0.12, col, 3])
+                for _ in range(int(18 * sc)):
+                    a = R.uniform(0, TAU)
+                    v = R.uniform(100, 280)
+                    sp(x, y, z, math.cos(a) * v, math.sin(a) * v, R.uniform(10, 120), R.uniform(0.25, 0.55), w3, 2, 0.3, 1)
+            elif kind == "warn":                                 # a warning: sparks climbing up from a danger spot
+                for _ in range(2):
+                    a = R.uniform(0, TAU)
+                    rr = R.uniform(0.5, 1.0) * sc
+                    sp(x + math.cos(a) * rr, y + math.sin(a) * rr, 2, 0, 0, R.uniform(60, 130), R.uniform(0.4, 0.8), col, 2, -0.1, 3)
+        finally:
+            self.net = was
+
     def ring(self, x, y, r0, r1, col, life=0.4, width=3, z=1.5, lift=True):
         if lift and self.maxh + self.maxroad > 0:
             z += self.top(x, y)
@@ -10006,6 +11518,8 @@ class Field:
                     self.bolt([tuple(p) for p in f[1]], tuple(f[2]), f[3], f[4])
                 elif k == "y":
                     self.say(str(f[1]), tuple(f[2]), f[3])
+                elif k == "k":
+                    self.fx_k(f[1], f[2], f[3], tuple(f[4]), f[5], f[6], f[7], False)
             except Exception:
                 pass
 
@@ -10023,14 +11537,32 @@ class Field:
                 p[0] += p[3] * dt
                 p[1] += p[4] * dt
                 p[2] += p[5] * dt
-                p[3] *= 0.96
-                p[4] *= 0.96
-                p[5] -= 260 * dt
-                if p[2] < 0.5:
-                    p[2] = 0.5
-                    p[5] = -p[5] * 0.4
+                if len(p) > 10:
+                    g, st = p[10], p[11]
+                    dr = 0.9 if st == 2 else 0.96
+                    p[3] *= dr
+                    p[4] *= dr
+                    p[5] = p[5] * (dr if st == 2 else 1.0) - 260 * g * dt
+                    if p[2] < 0.5 and g > 0:
+                        p[2] = 0.5
+                        p[5] = -p[5] * 0.4
+                else:
+                    p[3] *= 0.96
+                    p[4] *= 0.96
+                    p[5] -= 260 * dt
+                    if p[2] < 0.5:
+                        p[2] = 0.5
+                        p[5] = -p[5] * 0.4
                 p[6] -= dt
             self.parts = [p for p in self.parts if p[6] > 0]
+        if self.fx and self.towers and len(self.parts) < 700:
+            for tw in self.towers:
+                if tw.stun > 0.6 and self.frnd.random() < dt * 5:
+                    c = self.frnd.random()
+                    self._sp(tw.x + self.frnd.uniform(-6, 6), tw.y + self.frnd.uniform(-6, 6), tw.z + 12, self.frnd.uniform(-10, 10), self.frnd.uniform(-10, 10),
+                             self.frnd.uniform(25, 60), self.frnd.uniform(0.7, 1.2), (90, 90, 100), 5, -0.1, 2)
+                    if c < 0.4:
+                        self._sp(tw.x, tw.y, tw.z + 14, self.frnd.uniform(-60, 60), self.frnd.uniform(-60, 60), self.frnd.uniform(40, 120), 0.35, (120, 200, 255), 2, 0.6, 1)
         if self.rings:
             for r in self.rings:
                 r[5] -= dt
@@ -10053,6 +11585,734 @@ class Field:
 # ======================================================================
 #  THE WORLD  -  everything that happens in a match (no drawing here)
 # ======================================================================
+# ======================================================================
+#  HAZARDS  -  things in the level that fight back.  They warn you first, then stun towers or wreck them.
+#  A wrecked tower comes back by itself, faster with a MECHANIC close by (path towers are mended by the Mechanic as always).
+# ======================================================================
+HZ_FROM = 3                     # no hazards in the first waves
+HZ_DIFF = {"normal": 1.0, "hard": 1.15, "insane": 1.3, "event": 1.1}
+
+
+def _hz(arch, name, col, fx, rad, stun, dmg, every, warn=2.4, dur=0.6, frm=HZ_FROM, sq=False):
+    return dict(arch=arch, name=name, col=col, fx=fx, rad=rad, stun=stun, dmg=dmg, every=every, warn=warn, dur=dur, frm=frm, sq=sq)
+
+
+HAZ = {
+    "GRID": [_hz("strike", "POWER ARC", (90, 230, 255), "shock", 50, 3.5, 0.25, (24, 34), 2.6, 0.6, 4)],
+    "FROST": [_hz("strike", "ICE SHARD", (200, 235, 255), "ice", 62, 5.0, 0.30, (18, 26), 2.2),
+              _hz("sweep", "AVALANCHE", (225, 240, 255), "ice", 80, 4.0, 0.25, (42, 56), 3.2, 4.5, 7)],
+    "VOID": [_hz("strike", "VOID RIFT", (190, 100, 255), "void", 76, 5.5, 0.30, (18, 26), 2.4)],
+    "CITY": [_hz("beam", "ORBITAL RAILGUN", (255, 90, 170), "shock", 38, 6.0, 0.45, (22, 32), 2.8, 0.5, 4),
+             _hz("strike", "DRONE STRIKE", (255, 160, 60), "boom", 56, 5.0, 0.35, (20, 28), 2.2, 0.6, 5)],
+    "DUNES": [_hz("sweep", "SANDSTORM", (235, 195, 110), "slam", 90, 4.0, 0.25, (26, 36), 3.0, 5.0, 3)],
+    "INFERNO": [_hz("strike", "LAVA ERUPTION", (255, 110, 30), "fire", 72, 6.0, 0.40, (16, 24), 2.2),
+                _hz("sweep", "LAVA RISE", (255, 80, 20), "fire", 110, 6.0, 0.35, (44, 60), 3.4, 5.5, 8)],
+    "FOREST": [_hz("strike", "LIGHTNING", (200, 255, 150), "shock", 46, 5.0, 0.30, (14, 22), 1.7)],
+    "ABYSS": [_hz("sweep", "TIDAL WAVE", (90, 175, 255), "ice", 100, 4.0, 0.25, (28, 38), 3.0, 5.0),
+              _hz("strike", "WHIRLPOOL", (110, 150, 255), "void", 66, 5.0, 0.30, (22, 30), 2.4, 0.6, 5)],
+    "CRYSTAL": [_hz("strike", "CRYSTAL BURST", (210, 150, 255), "shock", 62, 5.0, 0.30, (15, 23), 2.0)],
+    "SKY": [_hz("beam", "STORM BOLT", (255, 255, 170), "shock", 30, 5.0, 0.35, (22, 32), 2.4, 0.5, 4),
+            _hz("sweep", "GALE", (210, 235, 255), "emp", 90, 3.5, 0.2, (36, 48), 3.0, 4.5, 6)],
+    "BLOODFAC": [_hz("strike", "BLOOD PRESS", (255, 70, 60), "slam", 58, 7.0, 0.50, (14, 22), 2.0, 0.5, 3, True),
+                 _hz("beam", "LASER CUTTER", (255, 100, 100), "shock", 30, 5.0, 0.40, (24, 34), 2.4, 0.5, 6),
+                 _hz("sweep", "STEAM BLAST", (255, 190, 170), "fire", 100, 5.0, 0.30, (40, 54), 3.0, 5.0, 12)],
+    "FACTORY": [_hz("strike", "STAMPING PRESS", (255, 175, 50), "slam", 56, 7.0, 0.50, (16, 24), 2.0, 0.5, 3, True),
+                _hz("beam", "LASER CUTTER", (255, 70, 70), "shock", 30, 5.0, 0.40, (30, 40), 2.6, 0.5, 6)],
+    "SUNSET": [_hz("beam", "SOLAR FLARE", (255, 160, 70), "fire", 42, 5.5, 0.40, (20, 30), 2.8, 0.6, 4)],
+    "BOARD": [_hz("sweep", "POWER SURGE", (90, 255, 220), "shock", 70, 4.0, 0.25, (26, 36), 3.0, 3.5, 4),
+              _hz("strike", "SHORT CIRCUIT", (255, 230, 90), "shock", 52, 4.5, 0.30, (16, 24), 1.9)],
+    "CORRUPTED": [_hz("strike", "GLITCH BURST", (255, 70, 210), "emp", 70, 5.0, 0.35, (14, 22), 1.8),
+                  _hz("sweep", "DATA WIPE", (120, 120, 255), "emp", 80, 4.0, 0.25, (34, 46), 3.0, 4.0, 6)],
+    "HALLOWEEN": [_hz("strike", "POLTERGEIST", (170, 255, 120), "void", 60, 5.0, 0.30, (16, 24), 2.2)],
+    "XMAS": [_hz("strike", "ELF CANNON", (255, 80, 80), "boom", 55, 5.0, 0.35, (16, 24), 2.2)],
+    "POND": [_hz("strike", "BIG SPLASH", (110, 205, 255), "ice", 70, 4.5, 0.25, (16, 24), 2.2)],
+    "KITCHEN": [_hz("strike", "FLAME BURST", (255, 140, 40), "fire", 60, 5.0, 0.35, (15, 23), 2.1)],
+    "GLITCH": [_hz("sweep", "BLUE SCREEN", (90, 130, 255), "emp", 80, 4.0, 0.3, (24, 34), 2.8, 4.0, 3)],
+    "MARKET": [_hz("sweep", "MARKET CRASH", (255, 80, 100), "slam", 90, 4.0, 0.3, (26, 36), 3.0, 4.5, 3),
+               _hz("strike", "MARGIN CALL", (255, 215, 90), "boom", 56, 5.0, 0.3, (18, 26), 2.2, 0.6, 5)],
+    "QUARRY": [_hz("strike", "DYNAMITE", (255, 200, 70), "boom", 80, 5.0, 0.35, (15, 23), 2.2),
+               _hz("sweep", "ROCKSLIDE", (200, 170, 130), "slam", 90, 4.0, 0.3, (40, 54), 3.0, 4.5, 7)],
+}
+HZ_GUN = (-26.0, FH / 2.0)                  # where beams come from: a gun that stands off the edge of the map
+
+
+def hz_def(theme, i):
+    L = HAZ.get(theme)
+    if not L:
+        return None
+    return L[i % len(L)]
+
+
+def hz_line(h):
+    """the two ends of a beam: from the gun, through the tower it is aimed at, to the far side"""
+    gx, gy = HZ_GUN
+    a = h["ang"]
+    return (gx, gy), (gx + math.cos(a) * 3000.0, gy + math.sin(a) * 3000.0)
+
+
+def hz_band(h, H):
+    """a sweeping hazard: the middle of its band right now, and the line it moves along (x or y)"""
+    horiz = abs(math.cos(h["ang"])) > 0.5                       # moves along x
+    span = (FW if horiz else FH) + 2 * H["rad"]
+    u = clamp((h["t"] - H["warn"]) / max(0.1, H["dur"]), 0.0, 1.0)
+    fwd = (math.cos(h["ang"]) if horiz else math.sin(h["ang"])) > 0
+    p = -H["rad"] + span * (u if fwd else 1 - u)
+    return horiz, p
+
+
+
+
+# ======================================================================
+#  INDOOR LEVELS  -  a room around the map: walls with things hung on them, and a roof with things hanging from it
+# ======================================================================
+IN_OFF = 48.0           # the walls stand this far outside the playing field
+IN_WALL = 150.0         # how tall the walls are
+IN_ROOF = 190.0         # where the roof is
+
+
+def in_wall_pt(wall, s, h):
+    """a spot on a wall: s runs along it (left to right as seen from inside the room), h is how high"""
+    if wall == 0:
+        return (-IN_OFF + s, -IN_OFF, h)
+    if wall == 1:
+        return (FW + IN_OFF, -IN_OFF + s, h)
+    if wall == 2:
+        return (FW + IN_OFF - s, FH + IN_OFF, h)
+    return (-IN_OFF, FH + IN_OFF - s, h)
+
+
+def in_wall_len(wall):
+    return (FW if wall % 2 == 0 else FH) + 2 * IN_OFF
+
+
+def in_kit(theme, mid):
+    """what hangs in this room: (wall colours, [per wall: list of items], [roof items]).  Always the same for the same map."""
+    rnd = random.Random("room" + mid)
+    walls = [[], [], [], []]
+    roof = []
+    K = dict(base=(30, 34, 52), trim=(120, 140, 200), glow=(120, 200, 255))
+    GOLDY = (255, 200, 60)
+
+    def spread(wi, n, fn, lo=60.0, hi=None):
+        L = in_wall_len(wi)
+        hi = L - 60.0 if hi is None else hi
+        for i in range(n):
+            s = lo + (hi - lo) * (i + 0.5) / n
+            fn(wi, s, i)
+
+    if theme == "BLOODFAC":
+        K = dict(base=(34, 16, 18), trim=(255, 60, 70), glow=(255, 50, 60))
+        RED_, RED2, RED3 = (255, 60, 70), (170, 24, 34), (255, 150, 150)
+        for wi in range(4):
+            L = in_wall_len(wi)
+            walls[wi].append(("stripes", 0, 0, L, 16))
+            for hh, c in ((44, RED_), (70, RED2), (96, (120, 120, 150))):
+                walls[wi].append(("pipe", 10, hh, L - 10, c, 4))
+            spread(wi, 4, lambda w_, s, i: walls[w_].append(("win", s - 36, 40, s + 36, 100, (230, 30, 44))), 120, L - 120)
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("circle", s + 120, 112, 15, (24, 12, 14), RED3, 1.5)), 100, L - 260)
+        walls[0].append(("text", 300, 124, "BLOOD FACTORY", RED3, 18))
+        walls[0].append(("text", 800, 124, "SPECIMENS TODAY: 4000", (255, 120, 120), 13))
+        walls[1].append(("text", 260, 128, "DO NOT TAP THE GLASS", RED3, 13))
+        walls[2].append(("text", 500, 128, "PEACE IS A DEFECT", (255, 100, 110), 14))
+        walls[3].append(("text", 320, 128, "WELCOME, NEW SPECIMEN", RED3, 13))
+        for i in range(5):
+            roof.append(("lamp", 140 + i * 210, 160 + (i % 2) * 320, 44, (255, 70, 80)))
+        roof.append(("crane", 0.0, FH * 0.5, FW, FH * 0.5, (255, 60, 60)))
+        roof.append(("pipe", 0.0, 70.0, FW, 70.0, (190, 40, 50)))
+        roof.append(("pipe", 0.0, FH - 70.0, FW, FH - 70.0, (120, 120, 160)))
+        for i in range(4):
+            roof.append(("ball", 220 + i * 230, 120 + (i % 2) * 400, 15, (255, 60, 70)))
+    elif theme == "FACTORY":
+        K = dict(base=(44, 40, 40), trim=(255, 170, 40), glow=(255, 150, 40))
+        for wi in range(4):
+            walls[wi].append(("stripes", 0, 0, in_wall_len(wi), 16))
+            for hh, c in ((44, (255, 170, 40)), (70, (200, 80, 40)), (96, (90, 150, 220))):
+                walls[wi].append(("pipe", 10, hh, in_wall_len(wi) - 10, c, 4))
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("circle", s, 100, 17, (30, 30, 36), (255, 220, 120), 1.5)), 140)
+            spread(wi, 2, lambda w_, s, i: walls[w_].append(("win", s - 40, 46, s + 40, 92, (255, 120, 30))), 220, in_wall_len(wi) - 160)
+        walls[0].append(("text", 300, 120, "SAFETY FIRST", (255, 220, 90), 15))
+        walls[0].append(("text", 760, 120, "0 DAYS WITHOUT AN ACCIDENT", (255, 120, 80), 13))
+        walls[1].append(("text", 260, 126, "FURNACE 3 - DO NOT FEED THE DUCK", (255, 170, 80), 12))
+        walls[3].append(("text", 300, 126, "NIGHT SHIFT: YOU", (200, 220, 255), 13))
+        walls[2].append(("text", 500, 126, "THE UNION SAYS HI", (200, 230, 200), 12))
+        for i in range(5):
+            roof.append(("lamp", 140 + i * 210, 160 + (i % 2) * 320, 44, (255, 190, 90)))
+        roof.append(("crane", 0.0, FH * 0.5, FW, FH * 0.5, (255, 190, 40)))
+        roof.append(("pipe", 0.0, 70.0, FW, 70.0, (200, 90, 40)))
+        roof.append(("pipe", 0.0, FH - 70.0, FW, FH - 70.0, (90, 150, 220)))
+    elif theme == "BOARD":
+        K = dict(base=(14, 40, 40), trim=(60, 255, 200), glow=(60, 255, 200))
+        for wi in range(4):
+            L = in_wall_len(wi)
+            for i in range(14):
+                walls[wi].append(("rect", 30 + i * (L - 60) / 14, 8, 30 + i * (L - 60) / 14 + 12, 72, (24, 70, 66), (60, 200, 170)))
+            spread(wi, 4, lambda w_, s, i: walls[w_].append(("lamp", s, 100, (255, 90, 90) if i % 2 else (90, 255, 140), 5)), 90)
+            walls[wi].append(("pipe", 10, 90, L - 10, (255, 200, 60), 3))
+            walls[wi].append(("pipe", 10, 100, L - 10, (255, 90, 160), 3))
+        walls[0].append(("screen", 360, 40, 560, 110, (90, 255, 200)))
+        walls[0].append(("text", 460, 124, "BIOS v2.8   FAN 1: OK", (160, 255, 220), 13))
+        walls[1].append(("text", 340, 124, "ALL YOUR BITS ARE BELONG TO US", (160, 255, 220), 12))
+        walls[3].append(("text", 360, 124, "CPU TEMP: SPICY", (255, 160, 120), 13))
+        for i in range(3):
+            roof.append(("fan", 220 + i * 300, 160 + (i % 2) * 310, 52, (60, 255, 200)))
+        roof.append(("cable", 0.0, 120.0, FW, 150.0, (255, 90, 160)))
+        roof.append(("cable", 0.0, FH - 140.0, FW, FH - 100.0, (255, 220, 80)))
+    elif theme == "CORRUPTED":
+        K = dict(base=(36, 14, 40), trim=(255, 70, 210), glow=(255, 70, 210))
+        for wi in range(4):
+            L = in_wall_len(wi)
+            spread(wi, 4, lambda w_, s, i: (walls[w_].append(("rect", s - 26, 6, s + 26, 100, (24, 10, 30), (255, 70, 210))),
+                                            [walls[w_].append(("lamp", s - 16 + (j % 2) * 30, 14 + (j // 2) * 18, (255, 60, 90) if (i + j) % 3 else (90, 255, 160), 4)) for j in range(6)]), 100)
+            walls[wi].append(("pipe", 10, 114, L - 10, (255, 70, 210), 2))
+        walls[0].append(("circle", 540, 70, 46, (10, 4, 14), (255, 70, 210), 0.0))
+        walls[0].append(("circle", 540, 70, 20, (255, 70, 210), (255, 255, 255), 0.0))
+        walls[0].append(("text", 540, 130, "THE ARCHITECT SEES YOU", (255, 120, 230), 15))
+        walls[1].append(("screen", 260, 40, 380, 90, (255, 80, 200)))
+        walls[1].append(("text", 320, 112, "ERR 0x00C0DE", (255, 100, 100), 13))
+        walls[3].append(("text", 340, 118, "ACCESS DENIED", (255, 80, 120), 15))
+        walls[2].append(("text", 520, 118, "have you tried turning it off?", (200, 160, 255), 12))
+        for i in range(6):
+            roof.append(("cable", 100 + i * 170, 40.0, 100 + i * 170 + rnd.uniform(-40, 40), FH - 40.0, (255, 70, 210)))
+        for i in range(4):
+            roof.append(("lamp", 160 + i * 230, 120 + (i % 2) * 380, 36, (255, 70, 210)))
+    elif theme == "CRYSTAL":
+        K = dict(base=(36, 28, 52), trim=(190, 140, 255), glow=(190, 140, 255))
+        for wi in range(4):
+            L = in_wall_len(wi)
+            for i in range(int(L / 90)):
+                s = 40 + i * 90 + rnd.uniform(-20, 20)
+                walls[wi].append(("tri", s, 4, rnd.uniform(18, 34), rnd.uniform(26, 70), (150, 100, 230) if i % 2 else (90, 200, 240), (230, 210, 255)))
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("rect", s - 6, 0, s + 6, IN_WALL - 10, (96, 66, 40), (160, 120, 70))), 200, in_wall_len(wi) - 150)
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("lamp", s + 24, 96, (255, 190, 90), 7)), 200, in_wall_len(wi) - 150)
+        walls[0].append(("text", 400, 124, "DANGER: UNSTABLE ROCK", (255, 200, 90), 14))
+        walls[1].append(("text", 300, 124, "MIND YOUR HEAD", (255, 200, 90), 14))
+        walls[3].append(("text", 360, 124, "LUNCH BREAK ->", (230, 210, 255), 13))
+        walls[2].append(("text", 520, 124, "NO DRAGONS BELOW THIS LINE", (230, 210, 255), 12))
+        for i in range(34):
+            roof.append(("stal", rnd.uniform(-20, FW + 20), rnd.uniform(-20, FH + 20), rnd.uniform(40, 110), rnd.uniform(9, 18), (150, 110, 220) if i % 3 else (90, 200, 240)))
+        for i in range(4):
+            roof.append(("lamp", 200 + i * 220, 100 + (i % 2) * 440, 44, (255, 190, 90)))
+    elif theme == "XMAS":
+        K = dict(base=(36, 40, 60), trim=(255, 80, 80), glow=(255, 220, 140))
+        for wi in range(4):
+            L = in_wall_len(wi)
+            walls[wi].append(("stripes2", 0, 0, L, 14))
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("shelf", s - 60, 52 + (i % 2) * 14, s + 60, (255, 90, 90) if i % 2 else (90, 210, 120))), 140, L - 140)
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("win", s - 36, 76, s + 36, 124, (220, 235, 255))), 260, L - 200)
+            spread(wi, 2, lambda w_, s, i: walls[w_].append(("circle", s, 100, 15, (30, 140, 70), (255, 80, 80), 0.0)), 360, L - 300)
+        walls[0].append(("text", 420, 134, "NAUGHTY LIST (VERY LONG)", (255, 120, 120), 13))
+        walls[1].append(("text", 300, 134, "DEC 24  - ONLY 0 SLEEPS", (255, 230, 140), 13))
+        walls[3].append(("text", 360, 134, "ELVES: UNIONIZE!", (160, 255, 190), 13))
+        for i in range(3):
+            roof.append(("garland", 0.0, 90.0 + i * 220, FW, 90.0 + i * 220, (255, 90, 90)))
+        for i in range(5):
+            roof.append(("ball", 160 + i * 190, 140 + (i % 2) * 360, 18, (255, 90, 90) if i % 2 else (90, 210, 120)))
+        roof.append(("banner", FW / 2 - 70, FH / 2 - 8, 140, 36, (200, 40, 40), "HO HO HO"))
+    elif theme == "KITCHEN":
+        K = dict(base=(60, 56, 62), trim=(255, 160, 80), glow=(255, 200, 120))
+        for wi in range(4):
+            L = in_wall_len(wi)
+            for i in range(int(L / 40)):
+                walls[wi].append(("rect", 10 + i * 40, 0, 10 + i * 40 + 38, 62, (200, 200, 210) if (i + wi) % 2 else (176, 176, 190), (120, 120, 140)))
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("shelf", s - 50, 96, s + 50, (200, 130, 80))), 160, L - 160)
+            spread(wi, 4, lambda w_, s, i: walls[w_].append(("circle", s, 112, 10 + (i % 2) * 3, (90, 90, 100), (200, 200, 220), 0.0)), 150, L - 150)
+        walls[0].append(("circle", 700, 96, 22, (240, 240, 240), (60, 60, 70), 2.0))
+        walls[0].append(("text", 360, 134, "TODAY: DUCK?  (NO)", (255, 220, 140), 15))
+        walls[1].append(("text", 300, 134, "WASH YOUR HANDS", (200, 230, 255), 14))
+        walls[3].append(("text", 320, 134, "CHEF IS ANGRY", (255, 150, 120), 14))
+        walls[2].append(("text", 500, 134, "OPEN 24H - OPEN 24H - OPEN 24H", (255, 200, 120), 12))
+        for i in range(6):
+            roof.append(("pan", 140 + i * 160, 120 + (i % 3) * 190, 18, (150, 150, 165)))
+        for i in range(4):
+            roof.append(("lamp", 200 + i * 230, 160 + (i % 2) * 320, 40, (255, 210, 130)))
+        roof.append(("pipe", 0.0, FH / 2, FW, FH / 2, (170, 170, 190)))
+    elif theme == "MARKET":
+        K = dict(base=(10, 30, 24), trim=(60, 235, 130), glow=(60, 235, 130))
+        for wi in range(4):
+            L = in_wall_len(wi)
+            spread(wi, 4, lambda w_, s, i: walls[w_].append(("screen", s - 60, 34, s + 60, 100, (60, 235, 130) if i % 2 else (255, 80, 100))), 120, L - 120)
+            walls[wi].append(("pipe", 10, 116, L - 10, (60, 235, 130), 2))
+        walls[0].append(("text", 300, 134, "BUY!!  SELL!!  BUY!!", (255, 230, 120), 15))
+        walls[0].append(("text", 780, 134, "STONKS ONLY GO UP", (130, 255, 170), 15))
+        walls[1].append(("text", 320, 134, "BULLS vs BEARS", (255, 150, 150), 14))
+        walls[3].append(("text", 340, 134, "THIS IS NOT FINANCIAL ADVICE", (200, 230, 210), 12))
+        for i in range(4):
+            roof.append(("screen3", 180 + i * 230, 150 + (i % 2) * 340, 70, 40, (60, 235, 130) if i % 2 else (255, 80, 100)))
+        for i in range(4):
+            roof.append(("lamp", 260 + i * 220, 330 + (i % 2) * 40, 36, (255, 230, 120)))
+    elif theme == "HALLOWEEN":
+        K = dict(base=(36, 26, 44), trim=(255, 140, 40), glow=(170, 255, 120))
+        for wi in range(4):
+            L = in_wall_len(wi)
+            walls[wi].append(("rect", 0, 0, L, 18, (56, 36, 30), (140, 90, 50)))
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("win", s - 30, 50, s + 30, 118, (150, 200, 255))), 180, L - 180)
+            spread(wi, 3, lambda w_, s, i: walls[w_].append(("portrait", s + 66, 84)), 180, L - 180)
+            spread(wi, 4, lambda w_, s, i: walls[w_].append(("lamp", s, 40, (255, 170, 60), 6)), 120, L - 120)
+        walls[0].append(("text", 500, 134, "BOO", (170, 255, 120), 22))
+        walls[1].append(("text", 300, 134, "NO TRESPASSING (GHOSTS ONLY)", (255, 170, 90), 12))
+        walls[3].append(("text", 340, 134, "THE BUTLER DID IT", (220, 200, 255), 14))
+        roof.append(("chandelier", FW / 2, FH / 2, 90, (255, 190, 90)))
+        for i in range(7):
+            roof.append(("bat", 100 + i * 140, 90 + (i % 3) * 200, 12, (40, 30, 56)))
+        for i in range(4):
+            roof.append(("ball", 220 + i * 230, 120 + (i % 2) * 400, 17, (255, 140, 40)))
+    return K, walls, roof
+
+
+
+
+# ---------------------------------------------------------------- the Blood Factory parkour (a real 3D obstacle course for your orb)
+OB_G = 1400.0
+OB_JUMP = 505.0
+OB_RUN = 150.0
+OB_SPR = 238.0
+OB_ACC = 1500.0
+OB_R = 7.5
+OB_H = 18.0
+OB_STEP = 7.0
+OB_KILL = -165.0
+_OB_STEEL = ((98, 102, 126), (70, 74, 98), (48, 52, 72))
+_OB_RUST = ((132, 88, 74), (96, 62, 52), (66, 42, 38))
+_OB_PIPE = ((150, 154, 172), (112, 116, 136), (80, 84, 104))
+_OB_DARK = ((74, 60, 70), (52, 42, 52), (36, 30, 38))
+_OB_DIRS = ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0))
+_OB_CACHE = []
+
+
+def ob_course():
+    """-> a dict: B (things to stand on), H (things that hurt), cps (checkpoints), says, line (the way through), cum, dec (scenery), door, end.
+    Every gap is a running jump (about 105) or a sprinting jump (about 170) at most."""
+    B, HZ, CPS, LINE, DEC, SAY, CPSAY = [], [], [], [], [], [], {}
+    T = dict(x=0.0, y=0.0, h=0)
+    rnd = random.Random(31337)
+
+    def W(f, l):
+        dx, dy = _OB_DIRS[T["h"]]
+        return T["x"] + dx * f - dy * l, T["y"] + dy * f + dx * l
+
+    def vec(a):
+        dx, dy = _OB_DIRS[T["h"]]
+        return {"f": (dx, dy, 0.0), "l": (-dy, dx, 0.0), "z": (0.0, 0.0, 1.0)}[a]
+
+    def blk(f0, f1, l0, l1, top, thick=14.0, col=_OB_STEEL, k="s", **kw):
+        ax, ay = W(f0, l0)
+        bx, by = W(f1, l1)
+        d = dict(k=k, x0=min(ax, bx), x1=max(ax, bx), y0=min(ay, by), y1=max(ay, by), z0=top - thick, z1=top, col=col, i=len(B))
+        d.update(kw)
+        B.append(d)
+        return d
+
+    def pad(f0, f1, l0, l1, top, thick=40.0):
+        return blk(f0, f1, l0, l1, top, thick, trim=True)
+
+    def mov(f0, f1, l0, l1, top, axis, amp, per, ph=0.0):
+        return blk(f0, f1, l0, l1, top, 12.0, _OB_STEEL, "m", mv=vec(axis), amp=amp, per=per, ph=ph)
+
+    def crumble(f0, f1, l0, l1, top):
+        return blk(f0, f1, l0, l1, top, 9.0, _OB_RUST, "c", st=0, tm=0.0)
+
+    def belt(f0, f1, l0, l1, top, v):
+        dx, dy = _OB_DIRS[T["h"]]
+        return blk(f0, f1, l0, l1, top, 14.0, _OB_DARK, "b", bv=(dx * v, dy * v), v=float(v))
+
+    def press(f0, f1, l0, l1, z0, thick, per, ph, amp):
+        ax, ay = W(f0, l0)
+        bx, by = W(f1, l1)
+        B.append(dict(k="p", x0=min(ax, bx), x1=max(ax, bx), y0=min(ay, by), y1=max(ay, by), z0=z0, z1=z0 + thick, col=_OB_RUST, per=per, ph=ph, amp=amp, i=len(B)))
+
+    def sweep(f, l, z, ln, w, ph=0.0):
+        cx, cy = W(f, l)
+        HZ.append(dict(k="sweep", cx=cx, cy=cy, z=z, len=ln, w=w, ph=ph))
+
+    def laser(f, l0, l1, z0, z1, per, duty, ph):
+        ax, ay = W(f - 2, l0)
+        bx, by = W(f + 2, l1)
+        HZ.append(dict(k="laser", x0=min(ax, bx), x1=max(ax, bx), y0=min(ay, by), y1=max(ay, by), z0=z0, z1=z1, per=per, duty=duty, ph=ph))
+
+    def flag(f, l, z):
+        x, y = W(f, l)
+        CPS.append((x, y, z))
+
+    def way(f, l, z):
+        x, y = W(f, l)
+        LINE.append((x, y, z))
+
+    def say(f, l, r, who, text, rage=0):
+        x, y = W(f, l)
+        SAY.append((x, y, r, who, text, rage))
+
+    def turn(f, l, d):
+        T["x"], T["y"] = W(f, l)
+        T["h"] = (T["h"] + d) % 4
+
+    # ---- 1. the roof (heading +x)
+    way(0, 0, 0)
+    pad(-80, 80, -80, 80, 0)
+    flag(0, 0, 0)
+    for f0, f1, l0, l1, top in ((150, 205, -35, 20, 10), (275, 330, -80, -25, 22), (400, 455, 0, 55, 22), (520, 560, -50, -10, 34), (640, 690, 10, 60, 34)):
+        blk(f0, f1, l0, l1, top, 14.0, trim=True)
+    mov(770, 830, -35, 35, 46, "l", 55, 3.2)
+    pad(920, 1080, -80, 80, 46)
+    flag(1000, 0, 46)
+    way(1000, 0, 46)
+    say(560, 0, 90, "SHADOW", "There is no rail. If you fall, I'll bring you back. Mostly.", 0)
+    CPSAY[1] = ("DESOLATION", "Hm? A draft. Someone left a door open.", 0)
+    turn(1000, 0, 1)
+    # ---- 2. the pipes (heading +y)
+    for f0, f1, l0, l1, top in ((150, 240, -44, -20, 58), (300, 390, 20, 44, 70), (450, 540, -44, -20, 82)):
+        blk(f0, f1, l0, l1, top, 12.0, _OB_PIPE, pipe=True)
+    crumble(610, 655, -45, 0, 84)
+    crumble(715, 760, 0, 45, 84)
+    crumble(820, 865, -45, 0, 84)
+    blk(940, 1090, -12, 12, 96, 12.0, _OB_PIPE, pipe=True)
+    mov(1170, 1230, -30, 30, 96, "z", 32, 2.8)
+    pad(1320, 1480, -80, 80, 112)
+    flag(1400, 0, 112)
+    way(1400, 0, 112)
+    say(380, 0, 100, "DESOLATION", "Those are MY pipes. Do you know how long they took to polish?", 1)
+    CPSAY[2] = ("SHADOW", "You're doing great. Eyes on the next ledge, not the floor.", 0)
+    turn(1400, 0, 1)
+    # ---- 3. the vats (heading -x)
+    belt(150, 290, -50, 50, 112, -85)
+    blk(360, 410, -25, 25, 118, 14.0, trim=True)
+    belt(480, 620, -50, 50, 118, 120)
+    mov(700, 760, -30, 30, 118, "l", 50, 2.6)
+    pad(850, 1030, -70, 70, 118, 30.0)
+    sweep(940, 0, 126, 62, 2.6, 0.0)
+    flag(862, 0, 118)
+    pad(1100, 1400, -70, 70, 118, 30.0)
+    sweep(1160, 0, 126, 52, 3.0, 0.0)
+    sweep(1340, 0, 126, 52, -3.4, 0.5)
+    pad(1470, 1590, -70, 70, 118, 30.0)
+    flag(1530, 0, 118)
+    way(1530, 0, 118)
+    say(200, 0, 120, "DESOLATION", "Rats. In my vats. THAT is unsanitary.", 2)
+    CPSAY[3] = ("DESOLATION", "I can see EVERYTHING in my factory. Except... where you are standing. Odd.", 2)
+    CPSAY[4] = ("SHADOW", "Keep your head down. Those presses count on you being tall.", 0)
+    turn(1530, 0, -1)
+    # ---- 4. the presses (heading +y)
+    pad(60, 620, -62, 62, 118, 30.0)
+    for i, pf in enumerate((230, 330, 430, 530)):
+        press(pf - 24, pf + 24, -58, 58, 118 + 56, 38, 2.4, 0.25 * i, 56)
+    mov(700, 750, -30, 30, 118, "l", 45, 2.6, 0.25)
+    pad(840, 1020, -70, 70, 118, 30.0)
+    laser(900, -70, 70, 118, 152, 3.0, 0.46, 0.0)
+    laser(960, -70, 70, 118, 152, 3.0, 0.46, 0.5)
+    pad(1100, 1220, -70, 70, 118, 30.0)
+    flag(1160, 0, 118)
+    way(1160, 0, 118)
+    say(160, 0, 100, "DESOLATION", "Let me help. I will turn the presses UP.", 3)
+    say(880, 0, 80, "DESOLATION", "You are still alive. Why are you still alive?", 3)
+    CPSAY[5] = ("DESOLATION", "STOP CLIMBING. THAT IS NOT A STAIRCASE.", 3)
+    turn(1160, 0, -1)
+    # ---- 5. the climb (heading +x): round and round a great vat, up to the door
+    pad(-80, 80, -80, 80, 118)
+    n = 17
+    cf, cl, R = 300.0, 0.0, 140.0
+    for i in range(n):
+        a = math.pi + i * (3 * math.pi / 16.0)
+        f, l = cf + R * math.cos(a), cl + R * math.sin(a)
+        top = 126 + 16 * i
+        h = 28 if i != 12 else 20
+        if i % 5 == 3:
+            crumble(f - h, f + h, l - h, l + h, top)
+        elif i == 8:
+            mov(f - h, f + h, l - h, l + h, top, "z", 18, 2.4)
+        else:
+            blk(f - h, f + h, l - h, l + h, top, 14.0, trim=True)
+        if i % 2 == 0:
+            way(f, l, top)
+    topz = 126 + 16 * (n - 1)
+    pad(490, 790, -80, 80, topz, 60.0)
+    sweep(600, 0, topz + 8, 60, 3.4, 0.0)
+    sweep(700, 0, topz + 8, 60, -3.4, 0.5)
+    flag(520, 0, topz)
+    way(760, 0, topz)
+    ex, ey = W(760, 0)
+    CPSAY[6] = ("SHADOW", "Almost there. The room is just ahead. He'll be waiting.", 0)
+    # the great door
+    dx0, dy0 = W(792, -62)
+    dx1, dy1 = W(808, 62)
+    door = dict(k="d", x0=min(dx0, dx1), x1=max(dx0, dx1), y0=min(dy0, dy1), y1=max(dy0, dy1), z0=topz, z1=topz + 80, col=((120, 20, 30), (90, 14, 22), (70, 10, 18)), i=len(B), open=0.0)
+    B.append(door)
+    for l0, l1, z1 in ((-72, -56, 92), (56, 72, 92)):
+        ax, ay = W(784, l0)
+        bx, by = W(816, l1)
+        B.append(dict(k="d", x0=min(ax, bx), x1=max(ax, bx), y0=min(ay, by), y1=max(ay, by), z0=topz, z1=topz + z1, col=_OB_STEEL, i=len(B)))
+    ax, ay = W(784, -72)
+    bx, by = W(816, 72)
+    B.append(dict(k="d", x0=min(ax, bx), x1=max(ax, bx), y0=min(ay, by), y1=max(ay, by), z0=topz + 80, z1=topz + 92, col=_OB_STEEL, i=len(B)))
+    # how far along the way a spot is
+    cum = [0.0]
+    for i in range(1, len(LINE)):
+        cum.append(cum[-1] + math.hypot(LINE[i][0] - LINE[i - 1][0], LINE[i][1] - LINE[i - 1][1]))
+    # scenery: pillars, vats with things in them, gears, chains
+    for i in range(1, len(LINE)):
+        x0, y0, z0 = LINE[i - 1]
+        x1, y1, z1 = LINE[i]
+        ln = math.hypot(x1 - x0, y1 - y0)
+        if ln < 1:
+            continue
+        ux, uy = (x1 - x0) / ln, (y1 - y0) / ln
+        d = rnd.uniform(40, 120)
+        while d < ln:
+            for side in (-1, 1):
+                off = side * rnd.uniform(280, 420)
+                px, py = x0 + ux * d - uy * off, y0 + uy * d + ux * off
+                zc = z0 + (z1 - z0) * d / ln
+                r = rnd.random()
+                if r < 0.45:
+                    DEC.append(dict(t="pil", x=px, y=py, w=rnd.uniform(24, 40), z0=OB_KILL - 40, z1=zc + rnd.uniform(220, 420), s=rnd.random()))
+                elif r < 0.8:
+                    DEC.append(dict(t="tank", x=px, y=py, rad=rnd.uniform(46, 66), z0=zc - 90, z1=zc + rnd.uniform(70, 150), s=rnd.random()))
+                elif r < 0.9:
+                    DEC.append(dict(t="gear", x=px, y=py, z=zc + rnd.uniform(30, 160), rad=rnd.uniform(70, 120), nx=abs(uy) > abs(ux), sp=rnd.choice((-0.4, 0.3, 0.5)), s=rnd.random()))
+                else:
+                    DEC.append(dict(t="chain", x=px, y=py, z0=zc + rnd.uniform(40, 120), z1=zc + 520, s=rnd.random()))
+            d += rnd.uniform(150, 230)
+    line = LINE
+    return dict(B=B, H=HZ, cps=CPS, cpsay=CPSAY, says=SAY, line=line, cum=cum, dec=DEC, door=door, end=(ex, ey, topz), total=cum[-1])
+
+
+def ob_press_off(u, amp):
+    if u < 0.50:
+        return 0.0
+    if u < 0.58:
+        return -amp * ((u - 0.50) / 0.08)
+    if u < 0.80:
+        return -amp
+    return -amp * (1.0 - (u - 0.80) / 0.20)
+
+
+def ob_solids(B, T, mode=0):
+    """every solid at time T as (block, x0, x1, y0, y1, z0, z1).  mode 0: things to stand on, 1: everything to draw, 2: only the presses"""
+    out = []
+    for b in B:
+        k = b["k"]
+        if k == "d":
+            if mode == 1:
+                z = b["open"] * 90.0 if "open" in b else 0.0
+                out.append((b, b["x0"], b["x1"], b["y0"], b["y1"], b["z0"] + z, b["z1"] + z))
+            continue
+        if k == "p":
+            if mode == 0:
+                continue
+            u = (T / b["per"] + b["ph"]) % 1.0
+            off = ob_press_off(u, b["amp"])
+            out.append((b, b["x0"], b["x1"], b["y0"], b["y1"], b["z0"] + off, b["z1"] + off))
+            continue
+        if mode == 2:
+            continue
+        if k == "c" and b["st"] == 2 and (mode == 0 or b["tm"] > 1.2):
+            continue
+        dx = dy = dz = 0.0
+        if k == "m":
+            o = b["amp"] * math.sin(TAU * (T / b["per"]) + b["ph"] * TAU)
+            dx, dy, dz = o * b["mv"][0], o * b["mv"][1], o * b["mv"][2]
+        out.append((b, b["x0"] + dx, b["x1"] + dx, b["y0"] + dy, b["y1"] + dy, b["z0"] + dz, b["z1"] + dz))
+    return out
+
+
+def ob_laser(h, T):
+    u = (T / h["per"] + h["ph"]) % 1.0
+    return u < h["duty"], u > 0.86
+
+
+def ob_hpos(h, T):
+    if h["k"] == "sweep":
+        return h["cx"], h["cy"], h["z"]
+    return (h["x0"] + h["x1"]) / 2, (h["y0"] + h["y1"]) / 2, (h["z0"] + h["z1"]) / 2
+
+
+def ob_hurts(h, T, x, y, z, R, H):
+    if h["k"] == "sweep":
+        a = h["ph"] + T * h["w"]
+        cx, cy, L = h["cx"], h["cy"], h["len"]
+        ex, ey = math.cos(a) * L, math.sin(a) * L
+        px, py = x - cx, y - cy
+        dd = ex * ex + ey * ey
+        t = clamp((px * ex + py * ey) / dd, -1.0, 1.0) if dd else 0.0
+        qx, qy = t * ex, t * ey
+        return (px - qx) ** 2 + (py - qy) ** 2 < (R + 3.5) ** 2 and z < h["z"] + 9 and z + H > h["z"] - 1
+    on, warn = ob_laser(h, T)
+    if not on:
+        return False
+    return h["x0"] - R < x < h["x1"] + R and h["y0"] - R < y < h["y1"] + R and z + H > h["z0"] and z < h["z1"]
+
+
+def ob_proj(C, x, y, z=None):
+    """-> (how far along the way (0..total), the way the way is heading there).  z (if given) tells the turns of a spiral apart"""
+    line, cum = C["line"], C["cum"]
+    bd, bs, ba = 1e18, 0.0, 0.0
+    for i in range(1, len(line)):
+        x0, y0 = line[i - 1][0], line[i - 1][1]
+        x1, y1 = line[i][0], line[i][1]
+        dx, dy = x1 - x0, y1 - y0
+        dd = dx * dx + dy * dy
+        if dd < 1:
+            continue
+        t = clamp(((x - x0) * dx + (y - y0) * dy) / dd, 0.0, 1.0)
+        px, py = x0 + dx * t, y0 + dy * t
+        d2 = (x - px) ** 2 + (y - py) ** 2
+        if z is not None:
+            pz = line[i - 1][2] + (line[i][2] - line[i - 1][2]) * t
+            d2 += (z - pz) ** 2
+        if d2 <= bd:
+            bd = d2
+            bs = cum[i - 1] + (cum[i] - cum[i - 1]) * t
+            ba = math.atan2(dy, dx)
+    return bs, ba
+
+
+def ob_new(C, cx=0.0, cy=0.0):
+    """a fresh run: the state of one orb on the course"""
+    c0 = C["cps"][0]
+    return dict(B=C["B"], H=C["H"], x=c0[0] + cx, y=c0[1] + cy, z=c0[2], vx=0.0, vy=0.0, vz=0.0, on=None, coy=0.0, buf=0.0, T=0.0, land=0.0,
+                dead=0.0, why="", prev={}, ev=[], dying=False)
+
+
+def ob_tick(o, dt):
+    """the crumbling floors keep their own time"""
+    for b in o["B"]:
+        if b["k"] == "c":
+            if b["st"] == 1:
+                b["tm"] += dt
+                if b["tm"] > 0.55:
+                    b["st"] = 2
+                    b["tm"] = 0.0
+            elif b["st"] == 2:
+                b["tm"] += dt
+                if b["tm"] > 3.2:
+                    b["st"] = 0
+
+
+def ob_phys(o, dt, ix, iy, jp, jh, sprint):
+    """one tiny step of the parkour physics.  (ix, iy) = the way you want to go in the world (length 0..1), jp = jump pressed now, jh = jump held"""
+    T = o["T"]
+    sol = ob_solids(o["B"], T)
+    n = math.hypot(ix, iy)
+    if n > 1.0:
+        ix, iy = ix / n, iy / n
+    sp = OB_SPR if sprint else OB_RUN
+    acc = OB_ACC * (1.0 if o["on"] is not None else 0.75)
+    for k, tv in (("vx", ix * sp), ("vy", iy * sp)):
+        d = tv - o[k]
+        st = acc * dt
+        o[k] += clamp(d, -st, st)
+    prev = o["prev"]
+    b = o["on"]
+    if b is not None:
+        pr = prev.get(b["i"])
+        cur = next((q for q in sol if q[0] is b), None)
+        if cur is not None and pr is not None:
+            o["x"] += cur[1] - pr[0]
+            o["y"] += cur[3] - pr[2]
+            o["z"] += cur[6] - pr[5]
+        if b["k"] == "b":
+            o["x"] += b["bv"][0] * dt
+            o["y"] += b["bv"][1] * dt
+    for q in sol:
+        prev[q[0]["i"]] = q[1:]
+    R = OB_R
+    H = OB_H
+    z = o["z"]
+
+    def hit(nx, ny, nz):
+        for q in sol:
+            if nx + R > q[1] and nx - R < q[2] and ny + R > q[3] and ny - R < q[4] and nz + H > q[5] + 0.01 and nz < q[6] - 0.01:
+                return q
+        return None
+
+    nx = o["x"] + o["vx"] * dt
+    q = hit(nx, o["y"], z)
+    if q is not None:
+        if q[6] - z <= OB_STEP and hit(nx, o["y"], q[6]) is None:
+            o["z"] = z = q[6]
+            o["x"] = nx
+        else:
+            o["vx"] = 0.0
+    else:
+        o["x"] = nx
+    ny = o["y"] + o["vy"] * dt
+    q = hit(o["x"], ny, z)
+    if q is not None:
+        if q[6] - z <= OB_STEP and hit(o["x"], ny, q[6]) is None:
+            o["z"] = z = q[6]
+            o["y"] = ny
+        else:
+            o["vy"] = 0.0
+    else:
+        o["y"] = ny
+    o["coy"] = max(0.0, o["coy"] - dt)
+    o["buf"] = max(0.0, o["buf"] - dt)
+    if jp:
+        o["buf"] = 0.13
+    grounded = False
+    if o["on"] is not None:
+        b = o["on"]
+        cur = next((q for q in sol if q[0] is b), None)
+        if cur is not None and o["x"] + R > cur[1] and o["x"] - R < cur[2] and o["y"] + R > cur[3] and o["y"] - R < cur[4] and abs(o["z"] - cur[6]) < 3.0:
+            grounded = True
+            o["z"] = cur[6]
+            o["vz"] = 0.0
+            o["coy"] = 0.1
+            if b["k"] == "c" and b["st"] == 0:
+                b["st"] = 1
+                b["tm"] = 0.0
+        else:
+            o["on"] = None
+    if not grounded:
+        o["on"] = None
+        if not jh and o["vz"] > 120:
+            o["vz"] -= 2400 * dt
+        o["vz"] -= OB_G * dt
+        nz = o["z"] + o["vz"] * dt
+        if o["vz"] <= 0:
+            best = None
+            for q in sol:
+                if o["x"] + R > q[1] and o["x"] - R < q[2] and o["y"] + R > q[3] and o["y"] - R < q[4] and o["z"] >= q[6] - 2.0 and nz <= q[6]:
+                    if best is None or q[6] > best[6]:
+                        best = q
+            if best is not None:
+                if o["vz"] < -260:
+                    o["ev"].append(("land", o["x"], o["y"], best[6]))
+                    o["land"] = 0.18
+                o["z"] = best[6]
+                o["vz"] = 0.0
+                o["on"] = best[0]
+                grounded = True
+            else:
+                o["z"] = nz
+        else:
+            bump = None
+            for q in sol:
+                if o["x"] + R > q[1] and o["x"] - R < q[2] and o["y"] + R > q[3] and o["y"] - R < q[4] and o["z"] + H <= q[5] + 1.0 and nz + H > q[5]:
+                    bump = q
+            if bump is not None:
+                o["vz"] = 0.0
+                o["z"] = bump[5] - H
+            else:
+                o["z"] = nz
+    if o["buf"] > 0 and (grounded or o["coy"] > 0):
+        o["vz"] = OB_JUMP
+        o["on"] = None
+        o["coy"] = 0.0
+        o["buf"] = 0.0
+        o["ev"].append(("jump",))
+    if o["z"] < OB_KILL:
+        o["ev"].append(("die", "fall"))
+        return
+    for q in ob_solids(o["B"], T, 2):
+        if o["x"] + R > q[1] + 1 and o["x"] - R < q[2] - 1 and o["y"] + R > q[3] and o["y"] - R < q[4] and o["z"] + H > q[5] + 2 and o["z"] < q[6] - 2:
+            o["ev"].append(("die", "crush"))
+            return
+    for h in o["H"]:
+        if ob_hurts(h, T, o["x"], o["y"], o["z"], R, H):
+            o["ev"].append(("die", "zap"))
+            return
+
+
+
 class World(Field):
     def __init__(self, mapkey, diff="normal", specs=None, seed=None, fx=True):
         Field.__init__(self, mapkey, fx)
@@ -10060,6 +12320,8 @@ class World(Field):
             diff = "event"
         self.diff = diff
         self.D = DIFFS[diff]
+        if self.map.get("dover"):
+            self.D = dict(self.D, **self.map["dover"])
         # how tough enemies are on this map: its own number, times a fine-tuning number for this difficulty
         self.maphp = self.map.get("hp", 1.0) * self.map.get("dhp", {}).get(diff, 1.0)
         self.seed = seed if seed is not None else random.randrange(1 << 30)
@@ -10100,6 +12362,26 @@ class World(Field):
         self.guide = []                 # what the bot did, for the strat videos
         self.next_id = 1
         self.rev = 0                    # goes up whenever the set of towers changes
+        self.sent = []                  # versus: enemies somebody sent here, waiting to walk in: [seconds left, kind]
+        self.sent_n = 0
+        self.orb_on = False             # orb powers and their cards (real matches only; tests and strat videos play without)
+        self.air_on = False             # flying enemies join the waves (real matches only)
+        self.bl_on = False              # Bloodlusts may turn up (real matches only)
+        self.bl_kills = 0
+        self.bf = None
+        if self.map.get("id") == "blood":
+            self.bf = dict(vox="", vt=0.0, rage=0, ph=0, timer=bf_time(len(self.players)), stars=[], st_t=0.0, lock=[], slam=None, tm={}, sid=0, said=set(), p2=0.0, missed=0, zapped=0,
+                           killed=0)
+        self.sup_k = 1.0                # how strong Commander buffs are (real matches: stronger, so you can feel them)
+        self.daily = None               # the daily challenge this match is (its date, map, twist and seed)
+        self.tw_spd = self.tw_hp = self.tw_pay = 1.0
+        self.tw_air = False
+        self.hz_on = False              # level hazards (the game turns them on for real matches; the strat videos and tests have none)
+        self.hz = []
+        self.hz_t = 8.0
+        self.hz_n = 0
+        self.hz_told = False
+        self.hrnd = random.Random(self.seed ^ 0x5A5A17)         # its own dice, so nothing else in the match changes
         self.next = self.make_wave(1)
 
     def hostiles(self):
@@ -10231,16 +12513,19 @@ class World(Field):
             e.block = None
         t.block = []
         t.down = True
-        if t.kind == "summoner" and self.goons:
+        if t.kind in ("summoner", "chainsaw") and self.goons:
             # its goons go with it
             for g in self.goons:
-                if g.tw is t:
+                if g.tw is t and g.lv < KING_LV:
                     g.dead = True
                     self.burst(g.x, g.y, GREY, 5, 90, 0.4, 2, g.r)
             self.goons = [g for g in self.goons if not g.dead]
         self.recalc()
 
     def set_mode(self, P, t):
+        if t is not None and t.owner is P and t.kind == "summoner":
+            t.mode = (t.mode + 1) % max(1, min(5, t.lv + 1))
+            return True
         if t is not None and t.owner is P and TOWERS[t.kind]["atk"] in ("RANGED", "MELEE", "BOTH"):
             t.mode = (t.mode + 1) % len(TARGET_MODES)
             return True
@@ -10295,7 +12580,7 @@ class World(Field):
                 v = c.L["act"] if c.act > 0 else c.L["pas"]
                 if v > b:
                     b = v
-        return b
+        return min(0.5, b * self.sup_k)
 
     def cd_of(self, t, base):
         k = (1 - min(0.6, t.owner.mods["rate"])) * (1 - self.rate_buff(t))
@@ -10316,7 +12601,36 @@ class World(Field):
                     self.burst(mk["x"], mk["y"], GOLD, 40, 220, 1.0, 4, 60)
                     self.sfx("secret")
 
+    def king_price(self, P):
+        return KING_PRICE + KING_STEP * P.kings
+
+    def send_king(self, P, t):
+        """a max-level Summoner sends the King of the Goons: it costs cash, and the price goes up every time"""
+        if t.kind != "summoner" or t.owner is not P or t.lv < MAXLV or t.acd > 0 or t.stun > 0 or self.phase != "wave":
+            return False
+        price = self.king_price(P)
+        if P.cash < price:
+            self.text(t.x, t.y, "NEED %d" % price, RED, 20, 1.0, 40)
+            return False
+        pi = self.goon_road()
+        if pi is None:
+            pi = 0
+        P.cash -= price
+        P.kings += 1
+        t.acd = KING_WAIT
+        p = self.paths[pi]
+        g = Goon(self.nid(), t, P, pi, p.length, KING_HP * self.goon_hp(t) / t.L["ghp"], KING_SPD, KING_LV)
+        self.place_goon(g)
+        self.goons.append(g)
+        t.swing = 1.0
+        self.sfx("clock")
+        self.ring(g.x, g.y, 8, 70, GOLD, 0.7, 4, 2)
+        self.text(g.x, g.y, "THE KING COMES!", GOLD, 24, 1.4, 50)
+        return True
+
     def tower_ability(self, P, t):
+        if t is not None and t.kind == "summoner":
+            return self.send_king(P, t)
         if t is None or t.owner is not P or t.kind != "commander" or t.acd > 0 or t.act > 0 or t.stun > 0 or self.phase != "wave":
             return False
         t.act = t.L["dur"] * (1.4 if t.tp == "drums" else 1.0)
@@ -10324,6 +12638,65 @@ class World(Field):
         self.sfx("clock")
         self.ring(t.x, t.y, 10, t.rng, RED, 0.6, 4, 2)
         self.text(t.x, t.y, "CALL TO ARMS!", RED, 22, 1.2, 50)
+        return True
+
+    def orb_shoot(self, P, tx, ty):
+        """your orb fires a bolt at (tx, ty)"""
+        if not self.orb_on or P.ocd > 0 or self.phase == "over" or not P.here:
+            return False
+        dx, dy = tx - P.x, ty - P.y
+        d = math.hypot(dx, dy)
+        if d < 1.0:
+            return False
+        P.ocd = ORB_CD / (1.0 + P.mods["orbrate"])
+        ca, sa = dx / d, dy / d
+        src = getattr(P, "osrc", None)
+        if src is None:
+            src = P.osrc = OrbSrc(P)
+        dmg = ORB_DMG * self.hm() * (1.0 + P.mods["orbdmg"]) * (1.0 + 0.5 * P.mods["dmg"])
+        s = Shot("pellet", P.x + ca * 12, P.y + sa * 12, dmg, src, mix_col(P.col, WHITE, 0.45), P.z + 10)
+        s.vx, s.vy = ca * ORB_SPD, sa * ORB_SPD
+        s.life = ORB_RANGE / ORB_SPD
+        s.pierce = int(P.mods["orbpierce"])
+        s.hit = set()
+        self.add_shot(s)
+        self.fx_k("muzzle", P.x + ca * 14, P.y + sa * 14, P.col, P.z + 10, 1.2, math.atan2(sa, ca), False)
+        self.sfx("shoot", 0.35)
+        return True
+
+    def orb_dash(self, P, dx, dy):
+        """your orb dashes: everything small on the way is shoved back down its road"""
+        d = math.hypot(dx, dy)
+        if not self.orb_on or P.dcd > 0 or d < 0.01 or self.phase == "over" or not P.here:
+            return False
+        P.dcd = DASH_CD * (1.0 - min(0.6, P.mods["dashcd"]))
+        ca, sa = dx / d, dy / d
+        push = DASH_PUSH * (1.0 + P.mods["dashkb"])
+        hit = 0
+        for e in self.enemies:
+            if e.dead or e.hidden:
+                continue
+            ex, ey = e.x - P.x, e.y - P.y
+            along = ex * ca + ey * sa
+            side = abs(-ex * sa + ey * ca)
+            if -15 <= along <= DASH_DIST + 30 and side <= 38 + e.r:
+                hit += 1
+                self.hurt(e, 3.0 * self.hm(), OrbSrc(P), True, True, P=P)
+                if e.dead:
+                    continue
+                if e.boss:
+                    e.slow = max(e.slow, 0.5)
+                    e.slow_t = 0.4
+                else:
+                    if e.block is not None:
+                        if e in e.block.block:
+                            e.block.block.remove(e)
+                        e.block = None
+                    e.d = max(0.0, e.d - push)
+                    e.freeze = max(e.freeze, 0.4)
+        self.ring(P.x, P.y, 6, 52, P.col, 0.35, 3, P.z + 2, False)
+        self.fx_k("slam", P.x + ca * 40, P.y + sa * 40, mix_col(P.col, WHITE, 0.4), P.z + 4, 0.7, None, False)
+        self.sfx("slash", 0.5 if hit else 0.3)
         return True
 
     def use_ability(self, P, slot, x, y):
@@ -10336,6 +12709,7 @@ class World(Field):
         P.acd[slot] = a["cd"] * (1 - min(0.6, P.mods["charge"]))
         self.casts.append(dict(kind=kind, x=x, y=y, t=0.0, hit=False, rad=a["rad"] * (1 + P.mods["splash"] * 0.5), P=P, id=self.nid()))
         self.sfx("card", 0.7)
+        self.fx_k("charge", x, y, a["col"], 8, 1.4)
         if kind == "napalm":
             for mk in self.marks:
                 if mk["id"] == "stove" and (mk["x"] - x) ** 2 + (mk["y"] - y) ** 2 < (a["rad"] + 10) ** 2:
@@ -10348,7 +12722,7 @@ class World(Field):
         if self.phase != "build":
             return False
         P.ready = True
-        if len(self.players) > 1:
+        if self.team():
             return True
         return self.start_wave()
 
@@ -10365,6 +12739,8 @@ class World(Field):
                 if len(act) > 4 and act[4] and kind in P.loadout and P.cash < self.cost(P, kind):
                     return self.plan(P, kind, x, y) is not None
                 return False
+            if k == "send":
+                return self.vs_send(P, int(act[1]))
             if k == "ready":
                 return self.ready(P)
             if k == "skip":
@@ -10373,6 +12749,10 @@ class World(Field):
                 return self.pick_card(P, int(act[1]))
             if k == "abil":
                 return self.use_ability(P, int(act[1]), float(act[2]), float(act[3]))
+            if k == "orb":
+                return self.orb_shoot(P, float(act[1]), float(act[2]))
+            if k == "dash":
+                return self.orb_dash(P, float(act[1]), float(act[2]))
             if k == "pos":
                 P.x, P.y = clamp(float(act[1]), -60, FW + 60), clamp(float(act[2]), -60, FH + 60)
                 P.z = clamp(float(act[3]), 0.0, 200.0) if len(act) > 3 else self.surf(P.x, P.y, P.z)
@@ -10400,6 +12780,31 @@ class World(Field):
         return False
 
     # ------------------------------------------------------------ waves
+    def apply_daily(self, info):
+        """turn this match into today's challenge"""
+        tw = TWIST_BY_KEY.get(info.get("twist"), TWISTS[0])
+        self.daily = info
+        self.tw_spd = tw.get("spd", 1.0)
+        self.tw_hp = tw.get("hp", 1.0)
+        self.tw_pay = tw.get("pay", 1.0)
+        self.tw_air = bool(tw.get("air"))
+        for P in self.players:
+            if "cash_set" in tw:
+                P.cash = float(tw["cash_set"])
+            P.cash += tw.get("cash", 0)
+        if "core" in tw:
+            self.maxhp = self.hp = float(tw["core"])
+        self.next = self.make_wave(1)
+        self.say("DAILY:  %s" % tw["name"], tw["col"], 4.0)
+
+    def open_n(self, w):
+        """how many roads are open in wave w (the Blood Factory opens its second gate at wave 16)"""
+        n = len(self.paths)
+        for pi, wv in (self.map.get("open") or {}).items():
+            if w < wv:
+                n = min(n, pi)
+        return max(1, n)
+
     def boss_of(self, w):
         b = self.map["bosses"]
         if w == self.nwaves:
@@ -10413,18 +12818,22 @@ class World(Field):
         early = self.D["early"]
         boss = self.boss_of(w)
         budget = wave_budget(w) * (0.5 if boss else 1.0)
-        avail = [k for k, v in WAVE_UNITS.items() if w + early >= v[0]]
-        picks = [k for k in avail if WAVE_UNITS[k][0] == w + early and w > 2][:1]
+        U = WAVE_UNITS
+        if self.air_on:
+            U = dict(WAVE_UNITS)
+            U.update(AIR_SKY if self.tw_air else AIR_UNITS)
+        avail = [k for k, v in U.items() if w + early >= v[0]]
+        picks = [k for k in avail if U[k][0] == w + early and w > 2][:1]
         pool = [k for k in avail if k not in picks]
         ng = 1 if w < 3 else 2 if w < 9 else 3
         while len(picks) < ng and pool:
-            ws = [WAVE_UNITS[k][2] * (1.6 if WAVE_UNITS[k][0] > w * 0.45 else 1.0) for k in pool]
+            ws = [U[k][2] * (1.6 if U[k][0] > w * 0.45 else 1.0) for k in pool]
             k = rnd.choices(pool, ws)[0]
             picks.append(k)
             pool.remove(k)
         shares = [rnd.uniform(0.6, 1.4) for _ in picks]
         tot = sum(shares)
-        groups = [[k, max(1, int(round(budget * sh / tot / WAVE_UNITS[k][1])))] for k, sh in zip(picks, shares)]
+        groups = [[k, max(1, int(round(budget * sh / tot / U[k][1])))] for k, sh in zip(picks, shares)]
         total = sum(n for _, n in groups)
         cap = 30 + w * 1.3
         hpx = 1.0
@@ -10433,19 +12842,23 @@ class World(Field):
             for g in groups:
                 g[1] = max(1, int(round(g[1] / hpx)))
         ev = []
-        npaths = len(self.paths)
+        npaths = self.open_n(w)
         totcost = 0.0
         for gi, (k, n) in enumerate(groups):
-            gap = WAVE_UNITS[k][3] * max(0.6, 1 - 0.012 * w)
+            gap = U[k][3] * max(0.6, 1 - 0.012 * w)
             start = gi * rnd.uniform(2.0, 4.5)
             for i in range(n):
-                ev.append([start + i * gap, k, (i + gi) % npaths, WAVE_UNITS[k][1]])
-                totcost += WAVE_UNITS[k][1]
+                ev.append([start + i * gap, k, (i + gi) % npaths, U[k][1]])
+                totcost += U[k][1]
         kc = kill_cash(w) * (0.55 + 0.45 * len(self.players))
         for e in ev:
             e[3] = kc * e[3] / totcost
         if boss:
-            ev.append([3.0, boss, rnd.randrange(npaths), wave_bonus(w)])
+            ev.append([3.0, boss, 0 if boss == "desolation" else rnd.randrange(npaths), wave_bonus(w)])
+        if self.bl_on and w >= 3 and not boss and not self.map.get("event"):
+            br = random.Random(self.seed * 313 + w * 17 + 5)
+            if br.random() < BLOODLUST_CHANCE:
+                ev.append([br.uniform(2.0, 9.0), "bloodlust", br.randrange(npaths), 0])
         ev.sort(key=lambda e: e[0])
         counts = {}
         for e in ev:
@@ -10454,7 +12867,7 @@ class World(Field):
 
     def hm(self, w=None, hpx=1.0):
         w = w or max(1, self.wave)
-        return hp_mult(w) * (self.D["hp"] + self.D["hpw"] * w) * self.maphp * hpx * self.mp
+        return hp_mult(w) * (self.D["hp"] + self.D["hpw"] * w) * self.maphp * hpx * self.mp * self.tw_hp
 
     def start_wave(self):
         if self.phase != "build":
@@ -10462,6 +12875,8 @@ class World(Field):
         self.wave += 1
         self.cur = self.next
         self.next = self.make_wave(self.wave + 1) if self.wave < self.nwaves else None
+        if self.bf is not None:
+            self.bf_wave(self.wave)
         self.queue = self.cur["ev"]
         self.qi = 0
         self.wt = 0.0
@@ -10481,6 +12896,8 @@ class World(Field):
 
     def skip_why(self):
         """'' when the wave can be skipped right now, else the reason it cannot"""
+        if self.vs is not None:
+            return "No skipping in a versus match"
         if self.phase != "wave" or self.cur is None:
             return "No wave is running"
         if self.cur["boss"]:
@@ -10518,6 +12935,8 @@ class World(Field):
         self.wave += 1
         self.cur = self.next
         self.next = self.make_wave(self.wave + 1) if self.wave < self.nwaves else None
+        if self.bf is not None:
+            self.bf_wave(self.wave)
         self.queue = sorted(rest + [list(ev) for ev in self.cur["ev"]], key=_first)
         self.qi = 0
         self.wt = 0.0
@@ -10546,7 +12965,7 @@ class World(Field):
                     final = True
                     hm = self.D["boss"] * self.mp / float(E["hp"])
                 else:
-                    hm = hp_mult(self.wave) ** BOSS_POW * BOSS_HP * (self.D["hp"] + self.D["hpw"] * self.wave) * self.maphp * self.mp
+                    hm = hp_mult(self.wave) ** BOSS_POW * BOSS_HP * (self.D["hp"] + self.D["hpw"] * self.wave) * self.maphp * self.mp * self.tw_hp
             else:
                 hm = self.hm(self.wave, self.cur["hpx"] if self.cur else 1.0)
         e = Enemy(self.nid(), kind, pi, d, hm, bounty, self.rnd.uniform(0, 4))
@@ -10557,7 +12976,7 @@ class World(Field):
             e.atk = (3 + E["hp"] * 0.05) * hp_mult(self.wave) ** 0.7
         if kind == "wrecker":
             e.atk *= 3
-        e.spd *= self.D["spd"]
+        e.spd *= self.D["spd"] * self.tw_spd
         p = self.paths[pi]
         e.x, e.y, seg = p.at(d)
         e.z = p.zat(d)
@@ -10565,20 +12984,26 @@ class World(Field):
         e.rem = p.length - d
         if kind == "blinker":
             e.a1 = self.rnd.uniform(2.5, 4.5)
+        if kind == "bloodlust":
+            e.a1 = 3.0
+            self.say("A BLOODLUST!   Destroy it!", (255, 50, 70), 2.6)
+            self.fx_k("warn", e.x, e.y, (255, 50, 70), 10, 24)
         if e.boss:
             self.boss = e
             e.a1, e.a2 = 5.0, 9.0
         self.enemies.append(e)
+        if kind == "desolation" and self.bf is not None:
+            self.bf_start(e)
         return e
 
     def wave_pay(self, w, label="WAVE CLEAR"):
         """the cash everyone gets for a wave (also paid early when a wave is skipped)"""
-        base = wave_bonus(w)
+        base = int(wave_bonus(w) * self.tw_pay)
         if self.cur and self.cur.get("boss") and self.cur.get("w") == w:
             base = int(base * BOSS_WAVE_PAY)        # a boss wave pays extra when it is over (there is no cash for the kill itself)
             if label == "WAVE CLEAR":
                 label = "BOSS WAVE CLEAR"
-        gains = dict((P.id, base) for P in self.players)
+        gains = dict((P.id, base + int(P.vs_inc)) for P in self.players)
         for t in self.towers:
             t.waves += 1
             if t.kind == "harvester":
@@ -10644,6 +13069,8 @@ class World(Field):
         out = []
         for cat in ("ATTACK", "DEFENSE", "SUPPORT"):
             pool = [c for c in CARDS if c[0] == cat]
+            if self.orb_on:
+                pool = pool + [c for c in ORB_CARDS if c[0] == cat]
             c = rnd.choice(pool)
             roll = rnd.random()
             epic = 0.08 + self.wave * 0.006
@@ -10690,6 +13117,8 @@ class World(Field):
             P = src.owner
             if src.mb:
                 dmg *= 1 + src.mb.get("dmg", 0)         # this map suits this tower
+            if getattr(src, "nopay", False):
+                pay = False
         m = P.mods if P is not None else MODS0
         took = 0.0
         if m["bossdmg"] and (e.boss or e.kind in ("elite", "jugger")):
@@ -10735,6 +13164,10 @@ class World(Field):
                     e.burn = b
                     e.burn_p = P
                 e.burn_t = 2.0
+            if crit:
+                self.fx_k("crit", e.x, e.y, GOLD, e.r + 6, 1.0)
+            elif self.frnd.random() < 0.45:
+                self.fx_k("hit", e.x, e.y, (src.owner.tcol(src.kind) if src is not None else WHITE), e.r + 4, 1.0)
             if not self.numbers:
                 pass
             elif crit:
@@ -10762,7 +13195,7 @@ class World(Field):
                 if f < lim:
                     pay = i + 1
                     break
-        got = pay * (1 + P.mods["bounty"]) + P.cfrac
+        got = pay * (1 + P.mods["bounty"]) * self.map.get("hitcash", 1.0) + P.cfrac
         whole = int(got)
         P.cfrac = got - whole
         P.cash += whole
@@ -10779,18 +13212,22 @@ class World(Field):
 
     def kill(self, e, src=None, P=None):
         e.dead = True
+        if self.bf is not None and e.boss:
+            self.bf_kill(e)
         if e.block is not None:
             if e in e.block.block:
                 e.block.block.remove(e)
             e.block = None
         self.stats["kills"] += 1
+        if e.kind == "bloodlust":
+            self.bl_kills += 1
         if src is not None:
             src.kills += 1
             P = src.owner
         # (no cash for the kill itself: enemies pay per HIT, see hit_cash)
         if P is not None:
             P.kills += 1
-        self.burst(e.x, e.y, e.col, 6 + e.r // 2, 140, 0.5, 3, e.r)
+        self.fx_k("bossdeath" if e.boss else ("bigdeath" if e.r >= 13 else "death"), e.x, e.y, e.col, e.r, max(0.6, e.r / 12.0))
         self.sfx("pop", 0.6)
         if self.fx:
             self.add_corpse(e)          # its body falls over (only for looks)
@@ -10845,7 +13282,7 @@ class World(Field):
         own = src.owner if src is not None else P
         rad *= 1 + (own.mods["splash"] if own is not None else 0)
         for e in list(self.enemies):
-            if e.dead:
+            if e.dead or (e.air and src is not None and (getattr(src, "path", False) or getattr(src, "kind", "") in GROUND_ONLY)):
                 continue
             d = math.hypot(e.x - x, e.y - y)
             if d <= rad + e.r:
@@ -10861,6 +13298,7 @@ class World(Field):
         self.ring(x, y, 8, rad, col, 0.35, 4)
         self.burst(x, y, col, 14, 200, 0.5, 3, 8)
         self.burst(x, y, WHITE, 5, 120, 0.3, 3, 8)
+        self.fx_k("boom", x, y, col, 8, clamp(rad / 70.0, 0.7, 2.2))
         self.sfx("boom", 0.7 if rad < 80 else 1.0)
         self.shake = max(self.shake, 0.15 if rad < 80 else 0.35)
 
@@ -10872,7 +13310,7 @@ class World(Field):
             return
         n = len(self.players)
         if self.phase == "cards":
-            if n > 1:
+            if self.team():
                 self.card_t -= dt
                 if self.card_t <= 0:
                     for P in self.players:
@@ -10884,7 +13322,7 @@ class World(Field):
         self.playtime += dt
         if self.plans:
             self.upd_plans()
-        if self.phase == "build" and n > 1:
+        if self.phase == "build" and self.team():
             # with friends nobody readies up: the next wave just starts a moment after the last one ended
             self.build_t += dt
             if self.build_t >= MP_WAVE_DELAY:
@@ -10903,11 +13341,36 @@ class World(Field):
                     P.acd[1] -= dt
                 if P.cash >= STONKS_GOAL:
                     self.flags.add("stonks")
+        if self.sent:
+            self.upd_sent(dt)
+        if self.bf is not None:
+            self.upd_bf(dt)
         for e in self.enemies:
             if not e.dead:
                 self.upd_enemy(e, dt)
-        for t in self.towers:
-            self.upd_tower(t, dt)
+        if self.air_on and any(e.air and not e.dead for e in self.enemies):
+            allen = self.enemies
+            ground = [e for e in allen if not e.air]
+            n0 = len(ground)
+            for t in self.towers:
+                if t.path or t.kind in GROUND_ONLY:
+                    self.enemies = ground
+                    self.upd_tower(t, dt)
+                    self.enemies = allen
+                else:
+                    self.upd_tower(t, dt)
+            if len(ground) > n0:
+                allen.extend(ground[n0:])       # (something a tower killed left new enemies behind: the splitter's minis)
+        else:
+            for t in self.towers:
+                self.upd_tower(t, dt)
+        if self.hz_on:
+            self.upd_hz(dt)
+        for P in self.players:
+            if P.ocd > 0:
+                P.ocd -= dt
+            if P.dcd > 0:
+                P.dcd -= dt
         if self.goons:
             self.upd_goons(dt)
         if self.shots:
@@ -10917,7 +13380,7 @@ class World(Field):
                 f[4] -= dt
                 r2 = f[2] * f[2]
                 for e in self.enemies:
-                    if not e.dead and (e.x - f[0]) ** 2 + (e.y - f[1]) ** 2 <= r2:
+                    if not e.dead and (e.x - f[0]) ** 2 + (e.y - f[1]) ** 2 <= r2 and not (e.air and f[5] is not None and (getattr(f[5], "path", False) or getattr(f[5], "kind", "") in GROUND_ONLY)):
                         self.hurt(e, f[3] * dt, f[5], True, True, P=f[7])
                 if self.fx and self.frnd.random() < dt * 14:
                     a = self.frnd.uniform(0, TAU)
@@ -10938,6 +13401,140 @@ class World(Field):
         self.enemies = [e for e in self.enemies if not e.dead]
         if self.phase == "wave" and self.qi >= len(self.queue) and not self.enemies:
             self.wave_clear()
+
+    # ------------------------------------------------------------ level hazards
+    def upd_hz(self, dt):
+        theme = self.map.get("theme")
+        if not HAZ.get(theme):
+            return
+        if self.phase == "build":
+            self.hz_t = max(self.hz_t, 8.0)         # never in the middle of building: the first one comes a while into a wave
+        H0 = HAZ[theme]
+        if self.phase == "wave" and self.towers:
+            wv = self.wave
+            ok = [i for i, H in enumerate(H0) if wv >= H["frm"]]
+            if ok:
+                self.hz_t -= dt
+                if self.hz_t <= 0 and len(self.hz) < (1 if wv < 12 else 2):
+                    i = self.hrnd.choice(ok)
+                    self.hz_spawn(i, H0[i])
+                    lo, hi = H0[i]["every"]
+                    k = 1.0 - min(0.35, (wv - H0[i]["frm"]) * 0.02)
+                    self.hz_t = self.hrnd.uniform(lo, hi) * k / HZ_DIFF.get(self.diff, 1.0)
+        for h in self.hz:
+            H = H0[h["i"] % len(H0)]
+            h["t"] += dt
+            if H["arch"] == "sweep":
+                self.hz_sweep(h, H, dt)
+            elif not h["fired"] and h["t"] >= H["warn"]:
+                h["fired"] = True
+                self.hz_fire(h, H)
+        self.hz = [h for h in self.hz if h["t"] < H0[h["i"] % len(H0)]["warn"] + H0[h["i"] % len(H0)]["dur"] + 0.3]
+
+    def hz_spawn(self, i, H):
+        if not self.towers:
+            return
+        t = self.hrnd.choice(self.towers)
+        self.hz_n += 1
+        h = dict(id=self.hz_n, i=i, arch=H["arch"], x=t.x + self.hrnd.uniform(-18, 18), y=t.y + self.hrnd.uniform(-18, 18), ang=0.0,
+                 rad=H["rad"], t=0.0, fired=False, hit=set())
+        if H["arch"] == "beam":
+            h["ang"] = math.atan2(t.y - HZ_GUN[1], t.x - HZ_GUN[0])
+        elif H["arch"] == "sweep":
+            h["ang"] = self.hrnd.choice((0.0, math.pi, math.pi / 2, -math.pi / 2))
+        self.hz.append(h)
+        if not self.hz_told:
+            self.hz_told = True
+            self.say("HAZARD: %s" % H["name"], H["col"], 2.6)
+        pos = (h["x"], h["y"]) if H["arch"] == "strike" else (t.x, t.y)
+        self.text(pos[0], pos[1], H["name"] + "!", H["col"], 20, min(2.0, H["warn"]), 56)
+        self.sfx("emp", 0.5)
+
+    def hz_scale(self, tw):
+        return HZ_DIFF.get(self.diff, 1.0)
+
+    def hz_hit(self, tw, H):
+        """a hazard caught this tower"""
+        k = self.hz_scale(tw)
+        if tw.path:
+            if tw.down:
+                return
+            tw.hp -= tw.maxhp * H["dmg"] * k * (1 - min(0.8, tw.owner.mods["harden"]))
+            tw.hit = 0.3
+            self.text(tw.x, tw.y, "SMASHED", RED, 20, 1.2, 40)
+            if tw.hp <= 0:
+                self.pt_fall(tw)
+        else:
+            was = tw.stun
+            self.emp([tw], min(2.0, (1.0 + clamp((H["stun"] - 3.5) / 3.5, 0.0, 1.0)) * (0.9 + 0.1 * k)))      # a hazard stuns for 1 to 2 seconds, not longer
+            if tw.stun > was:
+                tw.wreck = True
+                self.text(tw.x, tw.y, "WRECKED", RED, 20, 1.4, 40)
+        self.fx_k("boom", tw.x, tw.y, H["col"], 14, 0.9)
+
+    def hz_fire(self, h, H):
+        self.sfx("boom", 0.9)
+        self.shake = max(self.shake, 0.35)
+        if H["arch"] == "strike":
+            x, y, r = h["x"], h["y"], H["rad"]
+            for tw in list(self.towers):
+                d = (abs(tw.x - x), abs(tw.y - y)) if H["sq"] else (tw.x - x, tw.y - y)
+                inside = (d[0] <= r and d[1] <= r) if H["sq"] else (d[0] * d[0] + d[1] * d[1] <= (r + tw.box * 0.5) ** 2)
+                if inside:
+                    self.hz_hit(tw, H)
+            self.ring(x, y, 6, r * 1.15, H["col"], 0.5, 5)
+            self.ring(x, y, 6, r * 0.7, WHITE, 0.35, 3)
+            self.fx_k(H["fx"], x, y, H["col"], 10, r / 40.0)
+            self.fx_k("slam", x, y, H["col"], 6, r / 55.0)
+        else:                                            # beam
+            a, b = hz_line(h)
+            ca, sa = math.cos(h["ang"]), math.sin(h["ang"])
+            for tw in list(self.towers):
+                dx, dy = tw.x - a[0], tw.y - a[1]
+                along = dx * ca + dy * sa
+                side = abs(-dx * sa + dy * ca)
+                if along > 0 and side <= H["rad"] * 0.5 + tw.box * 0.5:
+                    self.hz_hit(tw, H)
+            n = 0
+            d = 60.0
+            while d < 1300:
+                px, py = a[0] + ca * d, a[1] + sa * d
+                if -30 <= px <= FW + 30 and -30 <= py <= FH + 30:
+                    n += 1
+                    if n % 2 == 0:
+                        self.fx_k(H["fx"], px, py, H["col"], 14, 0.5)
+                d += 36.0
+            e1 = (clamp(a[0] + ca * 3000, -80, FW + 80), clamp(a[1] + sa * 3000, -80, FH + 80))
+            self.bolt([(a[0], a[1], 40), (a[0] + ca * 900, a[1] + sa * 900, 40)], H["col"], 0.5, 6)
+            self.fx_k("slam", a[0] + ca * 40, a[1] + sa * 40, H["col"], 30, 1.4)
+
+    def hz_sweep(self, h, H, dt):
+        """a wall that moves across the whole map and wrecks every tower it passes"""
+        if h["t"] < H["warn"]:
+            return
+        horiz, p = hz_band(h, H)
+        half = H["rad"] * 0.5
+        if not h["fired"]:
+            h["fired"] = True
+            self.sfx("emp", 0.9)
+            self.shake = max(self.shake, 0.3)
+        for tw in list(self.towers):
+            if tw.id in h["hit"]:
+                continue
+            q = tw.x if horiz else tw.y
+            if abs(q - p) <= half + tw.box * 0.5:
+                h["hit"].add(tw.id)
+                self.hz_hit(tw, H)
+        if self.fx or self.net:
+            h["fxt"] = h.get("fxt", 0.0) - dt
+            if h["fxt"] <= 0:
+                h["fxt"] = 0.22
+                for j in range(5):
+                    c = (j + 0.5) / 5.0
+                    if horiz:
+                        self.fx_k(H["fx"], p, c * FH, H["col"], 10, 0.8)
+                    else:
+                        self.fx_k(H["fx"], c * FW, p, H["col"], 10, 0.8)
 
     # ------------------------------------------------------------ enemies
     def upd_enemy(self, e, dt):
@@ -10987,6 +13584,14 @@ class World(Field):
                         e.block.block.remove(e)
                     e.block = None
                 e.d = min(self.paths[e.pi].length - 30, e.d + 110)
+        elif k == "bloodlust":
+            e.a1 -= dt
+            if e.a1 <= 0:
+                e.a1 = 3.6
+                e.haste = 1.4
+                e.hmul = 1.9
+                self.ring(e.x, e.y, 4, 34, (255, 40, 60), 0.35, 3)
+                self.fx_k("warn", e.x, e.y, (255, 40, 60), 8, 14)
         elif k == "phantom":
             hid = (e.t % 4.2) > 2.5
             if hid:
@@ -11037,7 +13642,7 @@ class World(Field):
                     if e.act <= 0:
                         e.act = ACT_TIME        # swing (again)
                 sp = 0.0
-        elif self.ptowers and not back and sp > 0:
+        elif self.ptowers and not back and sp > 0 and not e.air:
             for t in self.ptowers:
                 if t.down:
                     continue
@@ -11104,6 +13709,7 @@ class World(Field):
         self.sfx("crash", 0.8)
         self.explode(t.x, t.y, L["brad"] * (1.35 if big else 1.0), L["boom"] * (1 + t.owner.mods["dmg"]), t, 0, 1.5 if big else 0.0, t.owner.tcol(t.kind))
         self.ring(t.x, t.y, 10, L["brad"] * 1.3, WHITE, 0.5, 3)
+        self.fx_k("bigdeath", t.x, t.y, t.owner.tcol(t.kind), 14, 1.2)
 
     def leak(self, e):
         e.dead = True
@@ -11120,6 +13726,7 @@ class World(Field):
         self.shake = max(self.shake, 0.5)
         self.ring(cx, cy, 16, 80, RED, 0.4, 4, 4)
         self.burst(cx, cy, RED, 16, 200, 0.5, 3, 24)
+        self.fx_k("slam", cx, cy, RED, 10, 1.0)
         self.text(cx, cy, "-%d" % min(dmg, 999), RED, 24, 0.8, 70)
         self.sfx("leak")
 
@@ -11139,6 +13746,7 @@ class World(Field):
             t.stun = max(t.stun, d)
             t.beam = False
             self.burst(t.x, t.y, PURPLE, 6, 80, 0.5, 3, 14)
+            self.fx_k("shock", t.x, t.y, PURPLE, 14, 0.8)
 
     def boss_ai(self, e, dt):
         k = e.ai
@@ -11147,11 +13755,19 @@ class World(Field):
         e.a1 -= dt
         e.a2 -= dt
         top = e.r * 2 + 40
+        if k == "desolation":
+            if self.bf is not None:
+                self.bf_boss_ai(e, dt)
+            return
+        if k == "scarecrow":
+            return
         if k == "overseer":
             if e.a1 <= 0:
                 e.a1 = 7.5
                 e.act = ACT_TIME
                 self.summon(e, ["grunt", "grunt", "runner", "shield" if self.wave >= 10 else "grunt"])
+                self.fx_k("charge", e.x, e.y, RED, 20, 1.6)
+                self.fx_k("slam", e.x, e.y, RED, 6, 1.3)
                 self.text(e.x, e.y, "REINFORCEMENTS", RED, 20, 1.2, top)
             if e.a2 <= 0:
                 e.a2 = 15.0
@@ -11159,12 +13775,14 @@ class World(Field):
                 e.smax = e.max * 0.06
                 e.shield = e.smax
                 self.ring(e.x, e.y, 60, e.r, BLUE, 0.5, 4, 10)
+                self.fx_k("ice", e.x, e.y, BLUE, 20, 1.3)
                 self.text(e.x, e.y, "SHIELD WALL", BLUE, 20, 1.2, top)
         elif k == "queen":
             if e.a1 <= 0:
                 e.a1 = 1.7
                 e.act = ACT_TIME
                 self.summon(e, ["swarm", "swarm"])
+                self.fx_k("warn", e.x, e.y, (255, 120, 220), 10, 24)
             if e.stage < 2 and e.hp < e.max * (0.66, 0.33)[e.stage]:
                 e.stage += 1
                 e.act = ACT_TIME
@@ -11172,6 +13790,8 @@ class World(Field):
                 e.haste = 3.5
                 e.hmul = 2.0
                 self.say(e.name + " SPRINTS!", ORANGE, 2)
+                self.fx_k("fire", e.x, e.y, ORANGE, 10, 1.8)
+                self.fx_k("slam", e.x, e.y, ORANGE, 6, 1.6)
                 self.sfx("emp")
         elif k == "titan":
             if e.a1 <= 0:
@@ -11180,6 +13800,8 @@ class World(Field):
                 hit = [t for t in self.towers if (t.x - e.x) ** 2 + (t.y - e.y) ** 2 < 175 * 175]
                 self.emp(hit, 3.0)
                 self.ring(e.x, e.y, e.r, 175, PURPLE, 0.6, 5, 6)
+                self.fx_k("emp", e.x, e.y, PURPLE, 10, 2.4)
+                self.fx_k("slam", e.x, e.y, PURPLE, 6, 2.0)
                 self.say("EMP PULSE!", PURPLE, 1.6)
                 self.sfx("emp")
                 self.shake = max(self.shake, 0.4)
@@ -11187,6 +13809,7 @@ class World(Field):
                 e.a2 = 14.0
                 e.act = ACT_TIME
                 e.dr = 3.5
+                self.fx_k("shock", e.x, e.y, GREY, 24, 1.6)
                 self.text(e.x, e.y, "FORTIFIED", GREY, 20, 1.4, top)
         elif k == "architect":
             st = 0 if e.hp > e.max * 0.66 else 1 if e.hp > e.max * 0.33 else 2
@@ -11194,6 +13817,8 @@ class World(Field):
                 e.stage = st
                 self.say(e.name + ": " + ("REWRITE" if st == 1 else "OVERDRIVE"), CYAN, 2.4)
                 self.ring(e.x, e.y, e.r, 240, CYAN, 0.7, 5, 6)
+                self.fx_k("shock", e.x, e.y, CYAN, 20, 2.6)
+                self.fx_k("emp", e.x, e.y, CYAN, 10, 2.8)
                 self.sfx("boss")
                 self.shake = max(self.shake, 0.5)
             if st == 2:
@@ -11212,6 +13837,7 @@ class World(Field):
                     for t in hit:
                         self.bolt([(e.x, e.y, e.z + 30), ((e.x + t.x) / 2 + self.frnd.uniform(-30, 30), (e.y + t.y) / 2 + self.frnd.uniform(-30, 30), 50), (t.x, t.y, t.z + 14)], CYAN, 0.5, 3)
                     self.emp(hit, 4.0)
+                    self.fx_k("charge", e.x, e.y, CYAN, 30, 1.6)
                     self.text(e.x, e.y, "HACK", CYAN, 22, 1.2, top)
                     self.sfx("emp")
                     if st == 2:
@@ -11220,11 +13846,399 @@ class World(Field):
                 e.a2 = 10.0
                 e.act = ACT_TIME
                 self.ring(e.x, e.y, 6, 50, CYAN, 0.35, 3)
+                self.fx_k("void", e.x, e.y, CYAN, 16, 1.2)
                 e.d = min(self.paths[e.pi].length - 60, e.d + 90)
+                self.fx_k("shock", e.x, e.y, CYAN, 16, 1.0)
+
+    # ------------------------------------------------------------ the Blood Factory
+    def bf_say(self, text, rage=None, secs=6.5):
+        bf = self.bf
+        bf["vox"] = text
+        bf["vt"] = secs
+        if rage is not None:
+            bf["rage"] = rage
+        self.sfx("boss" if bf["rage"] >= 3 else "emp", 0.5)
+
+    def bf_wave(self, w):
+        bf = self.bf
+        if w in BF_VOX:
+            self.bf_say(BF_VOX[w][0], BF_VOX[w][1])
+        if w == 16:
+            self.say("A SECOND GATE OPENS!", RED, 3.4)
+            self.shake = max(self.shake, 0.6)
+            p = self.paths[1]
+            self.fx_k("slam", p.pts[0][0], max(30.0, p.pts[0][1]), RED, 10, 2.0)
+        if w == self.nwaves:
+            self.say("DESOLATION IS COMING", RED, 3.4)
+
+    def bf_start(self, e):
+        bf = self.bf
+        bf["ph"] = 1
+        bf["timer"] = bf_time(len(self.players))
+        bf["tm"] = dict(reinf=7.0, shield=12.0, swarm=4.0, emp=10.0, fort=14.0, hack=9.0, zap=5.0, exe=13.0, slam=14.0)
+        self.bf_say(BF_VOX_BOSS[0], 4, 7.0)
+        self.shake = max(self.shake, 0.9)
+
+    def kill_tower(self, t):
+        """the boss destroys a tower.  It can come back (a Mechanic fixes it in no time), but only 3 to 5 times."""
+        if t.path or t.ruin or t not in self.towers:
+            return False
+        t.deaths += 1
+        if t.maxd <= 0:
+            t.maxd = 3 + int(t.x * 3 + t.y * 7 + t.id) % 3
+        self.bf["killed"] += 1
+        self.burst(t.x, t.y, RED, 18, 190, 0.6, 4, 16)
+        self.fx_k("bigdeath", t.x, t.y, RED, 14, 1.2)
+        self.sfx("crash", 0.8)
+        if t.deaths >= t.maxd:
+            t.ruin = True
+            t.stun = 9999.0
+            t.wreck = False
+            t.beam = False
+            self.text(t.x, t.y, "RUINED FOREVER", RED, 22, 2.2, 46)
+            self.ring(t.x, t.y, 6, 60, (60, 60, 70), 0.7, 5)
+        else:
+            t.stun = max(t.stun, BF_DEAD_STUN)
+            t.wreck = True
+            t.beam = False
+            left = t.maxd - t.deaths
+            self.text(t.x, t.y, "DESTROYED  %d left" % left, RED, 20, 1.8, 46)
+        return True
+
+    def bf_towers(self, x, y, r, path=False):
+        r2 = r * r
+        return [t for t in self.towers if not t.ruin and (path or not t.path) and (t.x - x) ** 2 + (t.y - y) ** 2 <= r2]
+
+    def bf_hit_bolt(self, e, t, col):
+        self.bolt([(e.x, e.y, e.z + 40), ((e.x + t.x) / 2 + self.frnd.uniform(-30, 30), (e.y + t.y) / 2 + self.frnd.uniform(-30, 30), 56), (t.x, t.y, t.z + 14)], col, 0.5, 3)
+
+    def bf_kill(self, e):
+        bf = self.bf
+        if e.kind == "desolation" and bf["ph"] == 1:
+            bf["ph"] = 2
+            bf["p2"] = 3.2
+            bf["st_t"] = BF_STAR_FIRST + 3.2
+            bf["lock"] = []
+            bf["slam"] = None
+            self.bf_say(BF_VOX_DEATH[0], 4, 4.2)
+            p = self.paths[0]
+            d = p.length * 0.58
+            hm = BF_SCARE_HP * self.mp / float(ENEMIES["scarecrow"]["hp"])
+            sc = self.spawn("scarecrow", 0, d, 0, hm)
+            sc.leak = 0
+            sc.spd = sc.cur = 0.0
+            sc.dr = 0.0
+            self.shake = 1.0
+            for i in range(5):
+                self.ring(sc.x, sc.y, 10, 80 + i * 55, (228, 168, 58), 0.5 + i * 0.12, 5)
+            self.burst(sc.x, sc.y, (228, 168, 58), 70, 360, 1.1, 5, 40)
+            self.fx_k("bossdeath", sc.x, sc.y, (228, 168, 58), 50, 2.4)
+            self.say("THE WALLS BREAK!", (255, 190, 80), 3.0)
+        elif e.kind == "scarecrow":
+            bf["ph"] = 3
+            bf["stars"] = []
+            self.bf_say(BF_VOX_END[0], 0, 8.0)
+
+    def upd_bf(self, dt):
+        bf = self.bf
+        if bf["vt"] > 0:
+            bf["vt"] -= dt
+        for L in bf["lock"]:
+            L[1] -= dt
+            if L[1] <= 0:
+                tw = next((t for t in self.towers if t.id == L[0]), None)
+                if tw is not None:
+                    self.kill_tower(tw)
+        bf["lock"] = [L for L in bf["lock"] if L[1] > 0]
+        sl = bf["slam"]
+        if sl is not None:
+            sl[2] -= dt
+            if sl[2] <= 0:
+                self.bf_slam_hit(sl[0], sl[1])
+                bf["slam"] = None
+        if bf["ph"] not in (1, 2) or self.phase == "over":
+            return
+        bf["timer"] -= dt
+        if bf["ph"] == 1:
+            if bf["timer"] < 120 and "min2" not in bf["said"]:
+                bf["said"].add("min2")
+                self.say("TWO MINUTES LEFT", ORANGE, 2.0)
+        if bf["timer"] <= 0:
+            bf["timer"] = 0.0
+            self.bf_say(BF_VOX_LOST[0], 4, 6.0)
+            self.say("TIME IS UP", RED, 4)
+            self.phase = "over"
+            self.result = "lose"
+            self.stars = 0
+            self.sfx("lose")
+            self.shake = 1.0
+            return
+        if bf["p2"] > 0:
+            bf["p2"] -= dt
+            if bf["p2"] <= 0 and bf["ph"] == 2:
+                self.bf_say(BF_VOX_SCARE[0], 4, 5.0)
+                self.sfx("boss")
+        if bf["ph"] == 2 and bf["p2"] <= 0:
+            self.upd_stars(dt)
+
+    def star_spots(self, n):
+        out = []
+        tries = 0
+        while len(out) < n and tries < 400:
+            tries += 1
+            x = self.rnd.uniform(70, FW - 70)
+            y = self.rnd.uniform(70, FH - 70)
+            if self.blocked(x, y, 18.0, True):
+                continue
+            if (x - self.core[0]) ** 2 + (y - self.core[1]) ** 2 < 90 * 90:
+                continue
+            if any((x - a) ** 2 + (y - b) ** 2 < 210 * 210 for a, b in out):
+                continue
+            out.append((x, y))
+        return out
+
+    def upd_stars(self, dt):
+        bf = self.bf
+        sc = next((e for e in self.enemies if e.kind == "scarecrow" and not e.dead), None)
+        if sc is None:
+            return
+        if not bf["stars"]:
+            bf["st_t"] -= dt
+            if bf["st_t"] <= 0:
+                spots = self.star_spots(3)
+                for x, y in spots:
+                    bf["sid"] += 1
+                    bf["stars"].append(dict(id=bf["sid"], x=x, y=y, life=BF_STAR_LIFE, prog=0.0))
+                    self.ring(x, y, 4, 60, (255, 230, 90), 0.6, 4)
+                    self.burst(x, y, (255, 230, 90), 24, 160, 0.8, 3, 30)
+                self.bf_say(BF_VOX_STARS[0], 4, 5.0)
+                self.say("3 STARS!  Stand on them to destroy them", (255, 230, 90), 3.2)
+                self.sfx("wave")
+                bf["st_t"] = BF_STAR_GAP
+            return
+        for s in bf["stars"]:
+            s["life"] -= dt
+            near = any(P.here and (P.x - s["x"]) ** 2 + (P.y - s["y"]) ** 2 <= BF_STAR_R * BF_STAR_R for P in self.players)
+            if near:
+                s["prog"] += dt
+            else:
+                s["prog"] = max(0.0, s["prog"] - dt * 0.6)
+        keep = []
+        for s in bf["stars"]:
+            if s["prog"] >= BF_STAR_WORK:
+                self.ring(s["x"], s["y"], 4, 80, (255, 255, 200), 0.5, 5)
+                self.burst(s["x"], s["y"], (255, 240, 140), 36, 240, 0.9, 4, 30)
+                self.text(s["x"], s["y"], "STAR DOWN", (255, 240, 140), 22, 1.4, 40)
+                self.sfx("upgrade", 0.8)
+                for P in self.players:
+                    P.cash += 100
+            elif s["life"] <= 0:
+                bf["missed"] += 1
+                sc.hp += BF_STAR_HEAL
+                sc.max = max(sc.max, sc.hp)
+                self.bolt([(s["x"], s["y"], 20), ((s["x"] + sc.x) / 2, (s["y"] + sc.y) / 2, 80), (sc.x, sc.y, 80)], (255, 230, 90), 0.7, 4)
+                self.text(sc.x, sc.y, "+%dk" % (BF_STAR_HEAL // 1000), RED, 26, 1.8, 120)
+                self.burst(s["x"], s["y"], RED, 20, 160, 0.7, 3, 20)
+                self.bf_say(BF_VOX_MISS[0], 4, 4.0)
+                self.sfx("emp", 0.7)
+            else:
+                keep.append(s)
+        bf["stars"] = keep
+
+    def bf_slam_hit(self, x, y):
+        self.shake = max(self.shake, 0.9)
+        self.sfx("boom", 1.0)
+        for i in range(3):
+            self.ring(x, y, 6, 100 + i * 55, RED, 0.45 + i * 0.12, 5)
+        self.fx_k("slam", x, y, RED, 10, 2.8)
+        self.burst(x, y, RED, 40, 260, 0.8, 4, 20)
+        self.burst(x, y, (255, 200, 90), 24, 220, 0.6, 3, 20)
+        near = self.bf_towers(x, y, 165.0)
+        self.emp(near, 6.0)
+        for t in near:
+            if (t.x - x) ** 2 + (t.y - y) ** 2 <= 82.0 * 82.0:
+                self.kill_tower(t)
+            else:
+                t.wreck = True
+
+    def bf_boss_ai(self, e, dt):
+        """DESOLATION: every robot boss's trick at once (but no flying, no blinking, no phantoms) and a few of his own"""
+        bf = self.bf
+        tm = bf["tm"]
+        for k in tm:
+            tm[k] -= dt
+        f = e.hp / e.max
+        rg = 0 if f > 0.66 else 1 if f > 0.33 else 2
+        top = e.r * 2 + 40
+        if f < 0.66 and "66" not in bf["said"]:
+            bf["said"].add("66")
+            self.bf_say(BF_VOX_66[0], 4, 4.0)
+            self.fx_k("shock", e.x, e.y, RED, 24, 2.0)
+            e.haste = 3.0
+            e.hmul = 1.5
+        if f < 0.33 and "33" not in bf["said"]:
+            bf["said"].add("33")
+            self.bf_say(BF_VOX_33[0], 4, 4.0)
+            self.summon(e, ["mini"] * 8)
+            e.haste = 4.0
+            e.hmul = 1.7
+            self.sfx("emp")
+        if tm["reinf"] <= 0:                                  # the Overseer's reinforcements
+            tm["reinf"] = 9.0 - rg
+            e.act = ACT_TIME
+            self.summon(e, ["grunt", "runner", "shield", "tank" if self.wave >= 10 else "grunt"])
+            self.fx_k("charge", e.x, e.y, RED, 20, 1.6)
+            self.text(e.x, e.y, "REINFORCEMENTS", RED, 20, 1.2, top)
+        if tm["shield"] <= 0:                                 # ...and its shield wall
+            tm["shield"] = 17.0
+            e.smax = e.max * 0.02
+            e.shield = e.smax
+            self.ring(e.x, e.y, 60, e.r, BLUE, 0.5, 4, 10)
+            self.text(e.x, e.y, "SHIELD WALL", BLUE, 20, 1.2, top)
+        if tm["swarm"] <= 0:                                  # the Hive Queen's swarms
+            tm["swarm"] = 4.5 - rg * 0.6
+            self.summon(e, ["swarm", "swarm"])
+        if tm["emp"] <= 0:                                    # the Titan's EMP
+            tm["emp"] = 12.0 - rg
+            e.act = ACT_TIME
+            self.emp([t for t in self.towers if (t.x - e.x) ** 2 + (t.y - e.y) ** 2 < 190 * 190 and not t.ruin], 3.0)
+            self.ring(e.x, e.y, e.r, 190, PURPLE, 0.6, 5, 6)
+            self.fx_k("emp", e.x, e.y, PURPLE, 10, 2.4)
+            self.text(e.x, e.y, "EMP PULSE", PURPLE, 20, 1.2, top)
+            self.sfx("emp")
+        if tm["fort"] <= 0 and f < 0.7:                       # ...and its armour
+            tm["fort"] = 16.0
+            e.dr = 3.0
+            self.fx_k("shock", e.x, e.y, GREY, 24, 1.6)
+            self.text(e.x, e.y, "FORTIFIED", GREY, 20, 1.4, top)
+        if tm["hack"] <= 0:                                   # the Architect's hack
+            tm["hack"] = 10.0 - rg * 1.5
+            e.act = ACT_TIME
+            pool = [t for t in self.towers if t.stun <= 0 and not t.ruin and t.kind not in ("harvester", "stonks")]
+            self.rnd.shuffle(pool)
+            hit = pool[:3 + rg]
+            for t in hit:
+                self.bf_hit_bolt(e, t, CYAN)
+            self.emp(hit, 4.0)
+            self.fx_k("charge", e.x, e.y, CYAN, 30, 1.6)
+            self.text(e.x, e.y, "HACK", CYAN, 22, 1.2, top)
+        if tm["zap"] <= 0:                                    # his own: stun towers from far away
+            tm["zap"] = 6.0 - rg * 1.0
+            pool = [t for t in self.bf_towers(e.x, e.y, 380.0) if t.stun <= 0]
+            if pool:
+                self.rnd.shuffle(pool)
+                hit = pool[:2 + rg]
+                for t in hit:
+                    self.bf_hit_bolt(e, t, (255, 90, 90))
+                self.emp(hit, 5.0)
+                e.act = ACT_TIME
+                self.text(e.x, e.y, "STUN", (255, 90, 90), 20, 1.0, top)
+                self.sfx("emp", 0.6)
+        if tm["exe"] <= 0:                                    # his own: destroy a tower from far away (it takes a moment, so you can see it coming)
+            tm["exe"] = 15.0 - rg * 2.5
+            pool = [t for t in self.bf_towers(e.x, e.y, 340.0) if not any(L[0] == t.id for L in bf["lock"])]
+            if pool:
+                t = self.rnd.choice(pool)
+                bf["lock"].append([t.id, 1.5])
+                e.act = ACT_TIME
+                self.bf_hit_bolt(e, t, (255, 40, 40))
+                self.text(e.x, e.y, "TARGET LOCKED", RED, 22, 1.4, top)
+                self.sfx("warn", 0.8)
+        if tm["slam"] <= 0 and bf["slam"] is None:           # his own: the chainsaws come down
+            tm["slam"] = 18.0 - rg * 2.5
+            e.slow = 1.0
+            e.slow_t = 1.4
+            e.act = 1.4
+            bf["slam"] = [e.x, e.y, 1.4]
+            self.text(e.x, e.y, "SLAM!", RED, 26, 1.4, top)
+            self.sfx("warn", 0.8)
+
+    # ------------------------------------------------------------ the saws
+    def upd_chainsaw(self, t, dt):
+        """every few seconds, while a wave runs, a saw rolls out of the core and up the road"""
+        if self.phase != "wave":
+            return
+        if t.cd > 0:
+            t.cd -= dt
+            if t.cd > 0:
+                return
+        L = t.L
+        n = 0
+        for g in self.goons:
+            if g.tw is t:
+                n += 1
+        if n >= L["cap"]:
+            return
+        pi = self.goon_road()
+        if pi is None:
+            return
+        t.cd += self.cd_of(t, L["cd"])
+        P = t.owner
+        p = self.paths[pi]
+        k = 1 + P.mods["dmg"] + t.db + (t.mb.get("hp", 0) if t.mb else 0)
+        g = Goon(self.nid(), t, P, pi, p.length, L["shp"] * k, L["gspd"], t.lv, 4)
+        g.sd = L["sdmg"] * (1 + P.mods["dmg"] + t.db)
+        self.place_goon(g)
+        self.goons.append(g)
+        t.swing = 1.0
+        self.ring(g.x, g.y, 6, 34, P.tcol("chainsaw"), 0.3, 3, 2)
+        self.sfx("slash", 0.5)
+
+    def saw_cut(self, g, dt):
+        """a saw cuts everything it touches, four times a second, and it wears down doing it"""
+        g.cd -= dt
+        if g.cd > 0:
+            return
+        g.cd = SAW_TICK
+        tw = g.tw if (g.tw is not None and g.tw in self.towers) else None
+        lim0 = g.r + 3
+        n = 0
+        for e in list(self.enemies):
+            if e.dead or e.hidden or e.air:
+                continue
+            lim = lim0 + e.r
+            if e.pi == g.pi:
+                if abs(e.d - g.d) > lim:
+                    continue
+            else:
+                dx, dy = e.x - g.x, e.y - g.y
+                if dx * dx + dy * dy > lim * lim or abs(e.z - g.z) > 12.0:
+                    continue
+            before = e.hp + e.shield
+            self.hurt(e, g.sd, tw, False, True, P=g.owner)
+            dealt = max(0.0, before - (e.hp + e.shield))
+            g.hp -= dealt * (SAW_WEAR_BOSS if e.boss else SAW_WEAR)
+            if e.dead:
+                g.hp -= g.max * SAW_KILL_WEAR
+            g.flash = 0.1
+            self.fx_k("hit", e.x, e.y, (255, 120, 90), e.r + 2, 0.8)
+            n += 1
+            if n >= 5:
+                break
+        if n and self.frnd.random() < 0.5:
+            self.burst(g.x, g.y, (255, 200, 90), 4, 120, 0.3, 2, g.r)
+        if g.hp <= 1e-6:
+            g.hp = 0.0
+            g.dead = True
+            self.burst(g.x, g.y, (255, 90, 80), 14, 190, 0.6, 3, g.r)
+            self.sfx("crash", 0.5)
+
+    def bf_snap(self):
+        bf = self.bf
+        if bf is None:
+            return None
+        return dict(ph=bf["ph"], tm=round(bf["timer"], 1), vox=bf["vox"] if bf["vt"] > 0 else "", rage=bf["rage"], vt=round(bf["vt"], 1),
+                    st=[[s["id"], int(s["x"]), int(s["y"]), round(s["life"], 1), round(s["prog"], 2)] for s in bf["stars"]],
+                    lk=[[L[0], round(L[1], 2)] for L in bf["lock"]], sl=([int(bf["slam"][0]), int(bf["slam"][1]), round(bf["slam"][2], 2)] if bf["slam"] else None),
+                    ms=bf["missed"], p2=round(bf["p2"], 1))
 
     # ------------------------------------------------------------ towers
     def upd_tower(self, t, dt):
         t.t += dt
+        if t.ruin:
+            t.beam = False
+            t.stun = 9999.0
+            return
         if t.recoil > 0:
             t.recoil = max(0.0, t.recoil - dt * 5)
         if t.swing > 0:
@@ -11236,10 +14250,10 @@ class World(Field):
         if t.duel > 0:
             t.duel -= dt
         k = t.kind
-        if k == "commander":
+        if k == "commander" or k == "summoner":
             if t.act > 0:
                 t.act -= dt
-            elif t.acd > 0 and self.phase == "wave":
+            elif t.acd > 0 and (self.phase == "wave" or k == "summoner"):
                 t.acd -= dt
         if t.path and t.down:
             # a Mechanic with rebuild in reach puts it back up mid-wave
@@ -11259,7 +14273,16 @@ class World(Field):
                     self.sfx("upgrade", 0.6)
             return
         if t.stun > 0:
-            t.stun -= dt
+            if t.wreck and t.mechs:
+                cl = 0.0
+                for mc in t.mechs:
+                    if mc.stun <= 0:
+                        cl = max(cl, mc.L["cleanse"])
+                t.stun -= dt * (1.0 + 4.0 * cl)         # a Mechanic nearby fixes a wreck much faster
+            else:
+                t.stun -= dt
+            if t.stun <= 0:
+                t.wreck = False
             t.beam = False
             return
         if k == "mechanic":
@@ -11274,6 +14297,9 @@ class World(Field):
             return
         if k == "summoner":
             self.upd_summoner(t, dt)
+            return
+        if k == "chainsaw":
+            self.upd_chainsaw(t, dt)
             return
         if k in NOFIGHT or k == "brick":
             return
@@ -11466,6 +14492,7 @@ class World(Field):
         ca, sa = math.cos(want), math.sin(want)
         col = P.tcol(k)
         zz = t.z + 14
+        self.fx_k("muzzle", t.x + ca * 18, t.y + sa * 18, col, zz - t.z, 1.0, want)
         if k == "blaster" or k == "sentinel":
             offs = [-5, 5] if L.get("twin") else [0]
             if t.tp == "triple":
@@ -11606,6 +14633,39 @@ class World(Field):
                 self.add_shot(s)
             self.sfx("ding" if k == "toaster" else "mortar", 0.5 if k == "toaster" else 1.0 if k == "annihilator" else 0.6)
 
+    # ------------------------------------------------------------ versus: sending enemies to the next player
+    def vs_send(self, P, i):
+        L = self.vs.get("link") if self.vs is not None else None
+        if L is None or self.phase == "over" or not (0 <= i < len(VS_SENDS)):
+            return False
+        lab, kind, n, base, gap, need = VS_SENDS[i]
+        cost = vs_cost(self.wave, i)
+        if self.wave < need or P.cash < cost:
+            return False
+        tg = L.target(self)
+        if tg is None or len(tg.sent) + n > VS_QUEUE:
+            return False
+        P.cash -= cost
+        P.vs_inc += cost * VS_INCOME
+        for k in range(n):
+            tg.sent.append([k * gap, kind])
+        tg.say("%s SENT %d %s" % (P.name, n, lab), ORANGE, 2.5)
+        tg.sfx("wave")
+        self.say("SENT %s" % lab, GREEN, 1.2)
+        return True
+
+    def upd_sent(self, dt):
+        keep = []
+        npaths = len(self.paths)
+        for it in self.sent:
+            it[0] -= dt
+            if it[0] <= 0:
+                self.spawn(it[1], self.sent_n % npaths, 0.0, 0.0)
+                self.sent_n += 1
+            else:
+                keep.append(it)
+        self.sent = keep
+
     # ------------------------------------------------------------ the Summoner and its goons
     def goon_road(self):
         """the road a new goon should take: the one whose enemy is closest to the core (or the one the next enemy comes in on).
@@ -11635,7 +14695,7 @@ class World(Field):
         L = t.L
         n = 0
         for g in self.goons:
-            if g.tw is t:
+            if g.tw is t and g.lv < KING_LV:
                 n += 1
         if n >= L["cap"]:
             return
@@ -11645,7 +14705,11 @@ class World(Field):
         t.cd += self.cd_of(t, L["cd"])
         P = t.owner
         p = self.paths[pi]
-        g = Goon(self.nid(), t, P, pi, p.length, self.goon_hp(t), L["gspd"], t.lv)
+        role = 0
+        if t.mode:
+            m = t.mode if t.mode < min(5, t.lv + 1) else 0
+            role = SQUAD_MIX[n % len(SQUAD_MIX)] if m == 4 else m
+        g = Goon(self.nid(), t, P, pi, p.length, self.goon_hp(t) * GOON_ROLE_HP[role], L["gspd"] * GOON_ROLE_SPD[role], t.lv, role)
         self.place_goon(g)
         self.goons.append(g)
         t.swing = 1.0
@@ -11665,12 +14729,17 @@ class World(Field):
                 self.burst(g.x, g.y, g.owner.tcol("summoner"), 5, 80, 0.4, 2, g.r)
                 continue
             self.place_goon(g)
+            if g.role == 4:
+                self.saw_cut(g, dt)
+                continue
+            if g.role >= 2:
+                self.goon_skill(g, dt)
             # the nearest enemy it touches (on its own road: by how far along they are; on a road that crosses or joins: by where they stand)
             best = None
             bg = 0.0
             gr = g.r
             for e in self.enemies:
-                if e.dead or e.hidden:
+                if e.dead or e.hidden or e.air:
                     continue
                 lim = gr + e.r
                 if e.pi == g.pi:
@@ -11691,6 +14760,45 @@ class World(Field):
             if best is not None:
                 self.goon_hit(g, best)
         self.goons = [g for g in self.goons if not g.dead]
+
+    def goon_skill(self, g, dt):
+        """archers shoot the nearest enemy in reach; healers mend the goons around them"""
+        g.cd -= dt
+        if g.role == 2:
+            if g.cd > 0:
+                return
+            best = None
+            bd = ARCHER_RNG * ARCHER_RNG
+            for e in self.enemies:
+                if e.dead or e.hidden:
+                    continue
+                dx, dy = e.x - g.x, e.y - g.y
+                q = dx * dx + dy * dy
+                if q < bd or (q == bd and best is not None and e.id < best.id):
+                    best, bd = e, q
+            if best is None:
+                return
+            g.cd = ARCHER_EVERY
+            tw = g.tw if (g.tw is not None and g.tw in self.towers) else None
+            e = best
+            self.bolt([(g.x, g.y, g.z + 8), (e.x, e.y, e.z + 6)], (255, 190, 90), 0.1, 1)
+            need = e.hp + e.shield
+            self.hurt(e, min(need, g.max * 0.3), tw, True, P=g.owner)
+            if not e.dead and e.dr <= 0 and e.hp + e.shield < 1e-6:
+                self.kill(e, tw, g.owner)
+            return
+        healed = False
+        hr2 = HEAL_RNG * HEAL_RNG
+        for o in self.goons:
+            if o is g or o.dead or o.lv >= KING_LV or o.hp >= o.max or o.owner is not g.owner:
+                continue
+            dx, dy = o.x - g.x, o.y - g.y
+            if dx * dx + dy * dy <= hr2:
+                o.hp = min(o.max, o.hp + o.max * 0.08 * dt)
+                healed = True
+        if healed and g.cd <= 0:
+            g.cd = 0.8
+            self.ring(g.x, g.y, 6, HEAL_RNG * 0.7, (90, 255, 140), 0.5, 2, 2)
 
     def goon_hit(self, g, e):
         """a goon and an enemy meet: they trade health.  Each loses what the weaker one had; the weaker one is destroyed."""
@@ -11848,6 +14956,9 @@ class World(Field):
                     self.ring(x, y, 10, rad, GOLD, 0.5, 6)
                     self.ring(x, y, 10, rad * 1.4, WHITE, 0.7, 2)
                     self.burst(x, y, GOLD, 40, 300, 0.8, 4, 6)
+                    self.fx_k("gold", x, y, GOLD, 6, 1.6)
+                    self.fx_k("slam", x, y, GOLD, 6, 1.4)
+                    self.fx_k("shock", x, y, WHITE, 20, 1.6)
                     self.shake = max(self.shake, 0.8)
                     self.sfx("strike")
                 c["dead"] = t > 2.0
@@ -11859,6 +14970,7 @@ class World(Field):
                             e.freeze = max(e.freeze, 1.0 if e.boss else 3.0)
                     self.ring(x, y, 10, rad, BLUE, 0.6, 6)
                     self.burst(x, y, WHITE, 40, 260, 0.9, 3, 6)
+                    self.fx_k("ice", x, y, BLUE, 6, 1.8)
                     self.sfx("freeze")
                 c["dead"] = t > 1.0
             elif k == "napalm":
@@ -11867,6 +14979,8 @@ class World(Field):
                     self.fields.append([x, y, rad, 16 * self.hm(), 6.0, None, ORANGE, P])
                     self.ring(x, y, 10, rad, ORANGE, 0.5, 5)
                     self.burst(x, y, ORANGE, 40, 240, 0.8, 4, 6)
+                    self.fx_k("fire", x, y, ORANGE, 6, 2.0)
+                    self.fx_k("boom", x, y, ORANGE, 6, 2.0)
                     self.sfx("boom")
                     self.shake = max(self.shake, 0.4)
                 c["dead"] = t > 0.9
@@ -11875,6 +14989,9 @@ class World(Field):
                     if not c["hit"]:
                         c["hit"] = True
                         self.sfx("emp")
+                        self.fx_k("void", x, y, PURPLE, 14, 2.0)
+                    if self.fx and self.frnd.random() < dt * 14:
+                        self.fx_k("void", x, y, PURPLE, 14, 1.4)
                     for e in self.enemies:
                         if not e.dead and math.hypot(e.x - x, e.y - y) <= rad + e.r:
                             if e.boss:
@@ -11905,6 +15022,7 @@ class World(Field):
                                     self.text(tw.x, tw.y, "+%d" % lost, GREEN, 22, 1.4, 40)
                     self.ring(x, y, 10, rad, ABILS[k]["col"], 0.6, 6)
                     self.burst(x, y, ABILS[k]["col"], 30, 200, 0.8, 3, 10)
+                    self.fx_k("heal", x, y, ABILS[k]["col"], 10, 2.0)
                     self.sfx("upgrade")
                 c["dead"] = t > 1.0
             elif k == "laser":
@@ -11912,6 +15030,10 @@ class World(Field):
                     if not c["hit"]:
                         c["hit"] = True
                         self.sfx("rail")
+                        self.fx_k("shock", x, y, RED, 10, 2.0)
+                        self.fx_k("slam", x, y, RED, 6, 1.0)
+                    if self.fx and self.frnd.random() < dt * 10:
+                        self.fx_k("fire", x, y, RED, 4, 0.5)
                     d = 95 * self.hm() * dt
                     for e in self.enemies:
                         if not e.dead and math.hypot(e.x - x, e.y - y) <= rad + e.r:
@@ -11928,6 +15050,7 @@ class World(Field):
                             tw.od = 8.0
                             self.burst(tw.x, tw.y, CYAN, 6, 90, 0.5, 3, 20)
                     self.ring(x, y, 10, rad, CYAN, 0.6, 6)
+                    self.fx_k("emp", x, y, CYAN, 10, 2.0)
                     self.sfx("clock")
                 c["dead"] = t > 1.0
         self.casts = [c for c in self.casts if not c.get("dead")]
@@ -12179,7 +15302,7 @@ class Bot:
                 want = "beacon"
             elif "graviton" in lo and n_atk >= 8 and w.wave >= 16 and cnt("graviton") < (1 if w.wave < 24 else 2):
                 want = "graviton"
-            elif "summoner" in lo and n_atk >= 3 and cnt("summoner") < (1 if w.wave < 12 else 2 if w.wave < 22 else 3):
+            elif "summoner" in lo and n_atk >= 3 and cnt("summoner") < SUMMONER_MAX:
                 want = "summoner"
             elif n_atk < min(4 + w.wave * 0.45, cap - 6) and len(mine) < cap:
                 ok = [k for k in atk if TOWERS[k]["lv"][0]["cost"] <= max(P.cash, 320 + 110 * w.wave) and (TOWERS[k]["tier"] != "LATE" or w.wave >= 13)] or atk[:1]
@@ -12484,7 +15607,8 @@ def world_snap(w, pid, fx):
         tw.append([t.id, t.kind, _r1(t.x), _r1(t.y), t.lv, t.owner.id, round(t.ang, 2), _r1(t.stun), _r1(t.act), _r1(t.acd), t.mode,
                    int(t.hp), int(t.maxhp), 1 if t.down else 0, 1 if t.beam else 0, t.tg.id if (t.tg is not None and not t.tg.dead) else 0,
                    t.tg2.id if (t.tg2 is not None and not t.tg2.dead) else 0, int(t.rng), int(t.mrng), _r1(t.od), round(t.rb, 2),
-                   round(t.recoil, 1), round(t.swing, 1), t.kills, int(t.dealt), int(t.spent), round(t.ramp, 1), 1 if t.hit > 0 else 0, round(t.db, 2)])
+                   round(t.recoil, 1), round(t.swing, 1), t.kills, int(t.dealt), int(t.spent), round(t.ramp, 1), 1 if t.hit > 0 else 0, round(t.db, 2),
+                   round(w.rate_buff(t), 3), t.deaths, t.maxd, 1 if t.ruin else 0])
     en = []
     for e in w.enemies:
         if e.dead:
@@ -12494,7 +15618,7 @@ def world_snap(w, pid, fx):
              (512 if e.act > ACT_TIME * 0.5 else 0)         # 512: it has just started an attack swing
         en.append([e.id, e.kind, e.pi, _r1(e.d), int(-e.cur if e.fear > 0 else e.cur), int(e.hp), int(e.max), int(e.shield), int(e.smax), fl])
     # goons: [id, road, how far along, health, full health, level, owner, speed, 1 if it was just hit, its Summoner's id]
-    go = [[g.id, g.pi, _r1(g.d), int(math.ceil(g.hp)), int(math.ceil(g.max)), g.lv, g.owner.id, _r1(g.spd), 1 if g.flash > 0 else 0, g.tid]
+    go = [[g.id, g.pi, _r1(g.d), int(math.ceil(g.hp)), int(math.ceil(g.max)), g.lv, g.owner.id, _r1(g.spd), 1 if g.flash > 0 else 0, g.tid, g.role]
           for g in w.goons if not g.dead]
     P = w.players[pid]
     return dict(t="snap", go=go, ph=w.phase, w=w.wave, hp=int(w.hp), mx=int(w.maxhp), ag=w.aegis, left=w.hostiles(), res=w.result, st=w.stars,
@@ -12502,14 +15626,17 @@ def world_snap(w, pid, fx):
                 nx=dict(counts=w.next["counts"], boss=w.next["boss"], w=w.next["w"]) if w.next else None,
                 cur=w.cur["boss"] if w.cur else None,
                 pl=[[int(q.cash), _r1(q.acd[0]), _r1(q.acd[1]), 1 if q.ready else 0, 1 if q.here else 0, int(q.x), int(q.y), q.kills, int(q.dealt),
-                     round(q.mods["discount"], 3), round(q.mods["recycle"], 3), 1 if q.offer else 0, 1 if q.skip else 0, int(q.z)] for q in w.players],
+                     round(q.mods["discount"], 3), round(q.mods["recycle"], 3), 1 if q.offer else 0, 1 if q.skip else 0, int(q.z), q.kings, _r1(q.ocd), _r1(q.dcd)] for q in w.players],
                 pn=[[t.id, t.kind, _r1(t.x), _r1(t.y), t.owner.id, round(t.ang, 2), int(t.rng)] for t in w.plans],
                 sk=[w.skip_why()] + list(w.skip_votes()), cl=w.cleared,
                 of=P.offer, cd=[[c["cat"], c["name"], c["rar"]] for c in P.cards],
                 tw=tw, en=en, bs=w.boss.id if w.boss is not None else 0,
                 ca=[[c["id"], c["kind"], int(c["x"]), int(c["y"]), _r1(c["t"]), int(c["rad"])] for c in w.casts],
                 fi=[[int(f[0]), int(f[1]), int(f[2]), _r1(f[4]), list(f[6])] for f in w.fields],
-                fx=fx, fl=sorted(w.flags), stt=w.stats, gm=w.gm)
+                fx=fx, fl=sorted(w.flags), stt=w.stats, gm=w.gm,
+                vs=({"i": w.vs["i"], "pl": w.vs["info"], "inc": int(P.vs_inc)} if w.vs is not None else None),
+                hz=[[h["id"], h["i"], int(h["x"]), int(h["y"]), round(h["ang"], 2), round(h["t"], 2)] for h in getattr(w, "hz", [])],
+                bf=w.bf_snap(), bk=getattr(w, "bl_kills", 0))
 
 
 class GuestWorld(Field):
@@ -12521,6 +15648,8 @@ class GuestWorld(Field):
             diff = "event"
         self.diff = diff
         self.D = DIFFS[diff]
+        if self.map.get("dover"):
+            self.D = dict(self.D, **self.map["dover"])
         self.players = [Player(i, s) for i, s in enumerate(specs)]
         self.maxhp = self.hp = self.D["core"]
         self.aegis = 0
@@ -12547,6 +15676,9 @@ class GuestWorld(Field):
         self.got = False
         self.cleared = 0
         self.skip_info = ["No wave is running", 0, 1]
+        self.hz = []
+        self.orb_on = True
+        self.bf = None
 
     def skip_why(self):
         return self.skip_info[0]
@@ -12568,13 +15700,23 @@ class GuestWorld(Field):
         self.result, self.stars = m["res"], m["st"]
         self.card_t = self.build_t = m["tm"]
         self.playtime = m["pt"]
+        self.bl_kills = m.get("bk", 0)
         self.next = m["nx"]
         self.cur = dict(boss=m["cur"])
         self.stats = m["stt"]
         self.gm = m["gm"]
+        if m.get("vs"):
+            self.vs = dict(i=int(m["vs"]["i"]), info=m["vs"]["pl"], inc=int(m["vs"].get("inc", 0)))
         self.flags = set(m["fl"])
+        self.hz = [dict(id=r[0], i=r[1], x=r[2], y=r[3], ang=r[4], t=r[5], rad=0, fired=False, hit=set()) for r in m.get("hz", [])]
+        bs = m.get("bf")
+        if bs is not None:
+            self.bf = dict(ph=bs["ph"], timer=bs["tm"], vox=bs["vox"], vt=bs["vt"], rage=bs["rage"], stars=[dict(id=s[0], x=s[1], y=s[2], life=s[3], prog=s[4]) for s in bs["st"]],
+                           lock=[list(L) for L in bs["lk"]], slam=bs["sl"], missed=bs["ms"], p2=bs["p2"])
         for q, d in zip(self.players, m["pl"]):
             q.cash, q.acd[0], q.acd[1], q.ready, q.here = d[0], d[1], d[2], bool(d[3]), bool(d[4])
+            q.kings = d[14] if len(d) > 14 else 0
+            q.ocd, q.dcd = (d[15], d[16]) if len(d) > 16 else (0.0, 0.0)
             if not getattr(q, "synced", False):
                 q.synced = True
                 q.x, q.y = d[5], d[6]
@@ -12664,7 +15806,7 @@ class GuestWorld(Field):
             g = self.gmap.get(d[0])
             if g is None:
                 own = self.players[d[6]] if 0 <= d[6] < len(self.players) else self.players[0]
-                g = self.gmap[d[0]] = Goon(d[0], None, own, d[1], d[2], d[4], d[7], d[5])
+                g = self.gmap[d[0]] = Goon(d[0], None, own, d[1], d[2], d[4], d[7], d[5], d[10] if len(d) > 10 else 0)
                 g.tid = d[9]
                 self.place_goon(g)
                 self.goons.append(g)
@@ -12712,6 +15854,11 @@ class GuestWorld(Field):
             if d[27]:
                 t.hit = 0.15
             t.db = d[28]
+            t.rbuf = d[29] if len(d) > 29 else 0.0
+            if len(d) > 32:
+                t.deaths, t.maxd, t.ruin = d[30], d[31], bool(d[32])
+                if t.ruin:
+                    t.stun = 9999.0
         if len(seen) != len(self.towers):
             for t in self.towers:
                 if t.id not in seen:
@@ -12736,12 +15883,19 @@ class GuestWorld(Field):
             pass
 
     def rate_buff(self, t):
-        return 0.0
+        return getattr(t, "rbuf", 0.0)
 
     def update(self, dt):
         """keep things moving smoothly between the host's messages"""
         self.time += dt
         self.upd_fx(dt)
+        for h in self.hz:
+            h["t"] += dt
+        for q in self.players:
+            if q.ocd > 0:
+                q.ocd -= dt
+            if q.dcd > 0:
+                q.dcd -= dt
         for e in self.enemies:
             e.t += dt
             if e.flash > 0:
@@ -13228,6 +16382,43 @@ JUMP_G = 582.0          # ...and how hard it is pulled back (22 high, a bit over
 SPRINT_K = 1.7          # how much faster you are while the sprint key is held
 
 
+class Versus:
+    """host side of a versus match: one World per player.  Cash spent on 'send' lands in the next player's World."""
+
+    def __init__(self, worlds):
+        self.worlds = worlds
+        self.info = []
+        for i, w in enumerate(worlds):
+            w.vs = dict(i=i, info=self.info, link=self)
+        self.refresh()
+
+    def target(self, w):
+        n = len(self.worlds)
+        i = w.vs["i"]
+        for k in range(1, n):
+            o = self.worlds[(i + k) % n]
+            if o.phase != "over":
+                return o
+        return None
+
+    def refresh(self):
+        self.info[:] = [[w.players[0].name, list(w.players[0].col)[:3], int(max(0, w.hp)), int(w.maxhp), w.wave,
+                         0 if (w.phase == "over" and w.result != "win") else 1,
+                         int(w.players[0].cash), len(w.towers), w.hostiles(), len(w.sent), int(w.players[0].vs_inc)] for w in self.worlds]
+
+    def judge(self):
+        """the last core standing wins"""
+        alive = [w for w in self.worlds if w.phase != "over"]
+        if len(alive) == 1 and len(self.worlds) > 1:
+            w = alive[0]
+            w.phase = "over"
+            w.result = "win"
+            w.stars = 0
+            w.say("YOU WIN!", GOLD, 4)
+            w.sfx("win")
+        self.refresh()
+
+
 class PlayScene(Scene):
     """the match scene, plus one thing: an orb that jumps is drawn in the air while its shadow stays on the ground"""
 
@@ -13303,6 +16494,12 @@ class Game:
             pass
         self.clock = pygame.time.Clock()
         self.audio = Audio()
+        self.obr = R3D()
+        self.obcam = Cam()
+        self.ob = None
+        self.obmp = None
+        self.ob_fk = 0.0
+        self.cs = None
         self.audio.vol = st["sfx"]
         self.audio.set_music(st["music"])
         GFX["glow"] = st["glow"]
@@ -13311,6 +16508,20 @@ class Game:
         self.cam = Cam()
         self.mfields = {}
         self.sel_guide = 0
+        self.sel_my = 0
+        self.my_del = None
+        self.my_del_t = 0.0
+        self.my_maps = []
+        self.ed = None
+        self.vsm = None             # the Versus manager while the host runs a versus match
+        self.dash = None            # an orb dash in progress: [dx, dy, seconds left]
+        self.orb_t = 0.0
+        self.watch_k = None         # versus: whose map you are looking at (None = your own)
+        self.watch_of = {}          # host: which map each guest is watching
+        self.spec_worlds = {}       # guest: copies of the maps being watched
+        self.spec_scene = None
+        self.match_args = None
+        self.reload_mymaps()
         self.running = True
         self.state = "menu"
         self.back_to = "menu"
@@ -13374,6 +16585,7 @@ class Game:
         self.over_net = False
         # menus
         self.sel_map = 0
+        self.sel_end = 0
         self.map_tab = 0
         self.view = "blaster"
         self.view_lv = 0
@@ -13478,7 +16690,8 @@ class Game:
                     perks=list(perks if perks is not None else sv["eq_perks"]), abils=list(abils or sv["eq_abils"]),
                     tperks=dict((k, v) for k, v in sv["eq_tperks"].items() if k in lo),
                     paint=dict((k, list(PAINTS[i])) for k, i in sv["paint"].items() if k in lo and i),
-                    rip=[k for k in lo if sv["etowers"].get(k) == "ripoff"])
+                    rip=[k for k in lo if sv["etowers"].get(k) == "ripoff"],
+                    blq=1 if sv["quests"].get("blood", 0) < BLOODLUST_NEED else 0)
 
     def goto(self, state):
         if state == "lobby":            # the lobby lives on the title screen now
@@ -13636,7 +16849,9 @@ class Game:
         sv["events"][ev] = time.time()
         E = EVENTS[ev]
         self.audio.play("secret")
-        if E["kind"] == "secret":
+        if E["kind"] == "special":
+            self.pop("THE %s IS OPEN.   Find it under EVENTS." % E["name"], E["col"], 6.0)
+        elif E["kind"] == "secret":
             self.pop("SECRET EVENT FOUND:  %s   (you have %d days to earn the real %s)" % (E["name"], EVENT_DAYS, TOWERS[E["tower"]]["name"]), E["col"], 6.0)
         else:
             self.pop("%s is open for you all year now   (out of season the prize is a RIPOFF)" % E["name"], E["col"], 6.0)
@@ -13773,7 +16988,7 @@ class Game:
             self.toast[2] -= dt
             sz = 22 if len(self.toast[0]) < 70 else 18
             r = pygame.Rect(0, 0, font(sz).size(self.toast[0])[0] + 48, 42)
-            r.midtop = (W // 2, 70)
+            r.midtop = (W // 2, 222 if getattr(self.world, 'bf', None) else 70)
             panel(s, r, PANEL, 240, self.toast[1], 10, 2)
             draw_text(s, self.toast[0], sz, WHITE, r.centerx, r.centery)
             if self.toast[2] <= 0:
@@ -13948,7 +17163,8 @@ class Game:
             self.wallet(W - 30, 34)
 
     TAB_GROUPS = (
-        (("maps", "MAPS", GREEN, "PICK A MAP"), ("events", "EVENTS", ORANGE, "EVENTS"), ("videos", "TUTORIALS", PINK, "TUTORIALS")),
+        (("maps", "MAPS", GREEN, "PICK A MAP"), ("endless", "ENDLESS", CYAN, "ENDLESS + DAILY"), ("mymaps", "MY MAPS", MINT, "MY MAPS"), ("events", "EVENTS", ORANGE, "EVENTS"),
+         ("videos", "TUTORIALS", PINK, "TUTORIALS")),
         (("towers", "TOWERS", CYAN, "TOWERS"), ("perks", "PERKS", PURPLE, "PERKS")),
         (("titles", "TITLES", GOLD, "TITLES"), ("customize", "COLOUR + CORE", CYAN, "COLOUR + CORE"), ("name", "NAME", MINT, "NAME")),
         (("settings", "SETTINGS", CYAN, "SETTINGS"), ("help", "HOW TO PLAY", MINT, "HOW TO PLAY"), ("changelog", "WHAT'S NEW", GOLD, "WHAT'S NEW"),
@@ -14041,21 +17257,49 @@ class Game:
             col = (int(col[0]), int(col[1]), int(col[2]))
         except Exception:
             col = WHITE
-        self.chat.append([name, col, text, self.time, clean_name(title, 24), None])
+        self.chat.append([name, col, text, self.time, clean_name(title, 24), None, chat_mood(text) if name else "calm"])
         del self.chat[:-40]
         return n
 
 
     # ------------------------------------------------------------ starting a match
-    def start_game(self, mapid, diff, specs=None, seed=None, me=0):
+    def today(self):
+        return os.environ.get("NB_TODAY") or time.strftime("%Y-%m-%d")
+
+    def daily_info(self, date=None):
+        """today's challenge: a map and a twist picked from the date, so everybody gets the same one"""
+        date = date or self.today()
+        seed = int("".join(c for c in date if c.isdigit()) or "1")
+        r = random.Random(seed * 7919)
+        m = MAIN_MAPS[r.randrange(len(MAIN_MAPS))]
+        tw = TWISTS[r.randrange(len(TWISTS))]
+        return dict(date=date, map=m["id"], twist=tw["key"], seed=seed)
+
+    def start_game(self, mapid, diff, specs=None, seed=None, me=0, daily=None):
         """a match that runs on this computer (alone, or as the Wi-Fi host)"""
+        self.vsm = None
+        if daily:
+            seed = daily["seed"]
         self.world = World(mapid, diff, [self.safe_spec(sp) for sp in (specs or [self.my_spec()])], seed)
         self.world.net = self.net is not None and self.net[0] == "host"
+        self.world.hz_on = True
+        self.world.orb_on = True
+        self.world.air_on = True
+        self.world.sup_k = SUP_K
+        # Bloodlusts turn up while ANYBODY in the room still needs one (every player in the room gets the credit for each one that falls)
+        need = self.save["quests"].get("blood", 0) < BLOODLUST_NEED
+        if specs and len(specs) > 1:
+            need = any(sp.get("blq", 1) for sp in specs if isinstance(sp, dict))
+        self.world.bl_on = need and not self.world.map.get("event") and not daily
+        if daily:
+            self.world.apply_daily(daily)
         self.me = me
         self.begin_match()
 
     def start_guest(self, mapid, diff, specs, me):
         specs = [self.safe_spec(sp) for sp in specs]
+        self.vsm = None
+        self.match_args = (mapid, diff)
         self.world = GuestWorld(mapid, diff, specs)
         self.me = clamp(me, 0, len(specs) - 1)
         self.world.players[self.me].local = True
@@ -14083,6 +17327,7 @@ class Game:
         self.card_t = 0.0
         self.msg = None
         self.talk = None
+        self.bl_seen = 0
         self.typing = None
         self.knocks = 0
         self.cine = False
@@ -14091,6 +17336,11 @@ class Game:
         self.hov_slot = None
         P = w.players[self.me]
         self.cash_show = float(P.cash)
+        self.dash = None
+        self.orb_t = 0.0
+        self.watch_k = None
+        self.watch_of = {}
+        self.spec_worlds = {}
         self.cyaw, self.cpitch, self.cdist = -math.pi / 2, 0.98, 700.0
         self.cdist_t = 700.0            # the zoom glides towards this
         self.z2 = 1.0                   # zoom of the flat 2D view, and the spot it looks at
@@ -14115,6 +17365,10 @@ class Game:
                           (self.kmove(), self.kname("sprint"), self.kname("jump")))
             self.chat_add("", GREY, "Scroll zooms. %s is the flat 2D view. Walk up to people with a ! and press %s to talk." %
                           (self.kname("view"), self.kname("talk")))
+        if "tip_orb" not in sv["seen"] and sv["settings"]["view3d"]:
+            sv["seen"].append("tip_orb")
+            self.chat_add("", GREY, "Your orb can fight too: hold %s to shoot where the mouse points, %s to dash and shove enemies back." %
+                          (self.kname("orbshot"), self.kname("dash")))
 
     def leave_net(self):
         if self.net:
@@ -14126,6 +17380,7 @@ class Game:
             except Exception:
                 pass
         self.net = None
+        self.obmp = None
         if self.finder is not None:
             self.finder.close()
             self.finder = None
@@ -14202,6 +17457,11 @@ class Game:
         if t is not None:
             if TOWERS[t.kind]["atk"] in ("RANGED", "MELEE", "BOTH"):
                 self.act("mode", t.id)
+            elif t.kind == "summoner":
+                if t.lv < 1:
+                    self.say("Level 2 sends shield goons", GREY)
+                else:
+                    self.act("mode", t.id)
             else:
                 self.say("%s does not pick targets" % t.owner.tname(t.kind), GREY)
 
@@ -14209,13 +17469,23 @@ class Game:
         w = self.world
         P = w.players[self.me]
         t = self.sel if self.sel is not None else self.hov
-        if t is None or t.kind != "commander" or t.owner is not P:
+        if t is None or t.kind not in ("commander", "summoner") or t.owner is not P:
             ready = [c for c in w.towers if c.kind == "commander" and c.owner is P and c.acd <= 0 and c.act <= 0]
+            ready += [c for c in w.towers if c.kind == "summoner" and c.owner is P and c.lv >= MAXLV and c.acd <= 0]
             t = ready[0] if ready else None
         if t is None:
-            self.say("No tower ability ready (the Commander has one)", GREY)
+            self.say("No tower ability ready (Commander, or a max-level Summoner)", GREY)
         elif w.phase != "wave":
             self.say("Abilities only work during a wave", GREY)
+        elif t.kind == "summoner":
+            if t.lv < MAXLV:
+                self.say("The Summoner needs max level to send the King", GREY)
+            elif t.acd > 0:
+                self.say("The next King comes in %ds" % math.ceil(t.acd), GREY)
+            elif P.cash < w.king_price(P):
+                self.say("The King costs %d cash" % w.king_price(P), RED)
+            else:
+                self.act("tabil", t.id)
         elif t.acd > 0 or t.act > 0:
             self.say("Call to Arms is recharging", GREY)
         else:
@@ -14244,6 +17514,10 @@ class Game:
 
     def start_talk(self, n):
         sv = self.save
+        if n.get("act") == "shadow":
+            n["lines"] = self.bf_lines()
+            if self.save["bf"].get("yes"):
+                n["act"] = "shadow"
         self.talk = [n, 0]
         self.audio.play("talk")
         if n["id"] not in sv["npcs"]:
@@ -14252,12 +17526,81 @@ class Game:
             self.check_titles()
             self.store()
 
+    def bl_progress(self, w):
+        """a Bloodlust fell: that counts towards the secret quest"""
+        n = getattr(w, "bl_kills", 0)
+        if n <= self.bl_seen:
+            return
+        d = n - self.bl_seen
+        self.bl_seen = n
+        sv = self.save
+        have = sv["quests"].get("blood", 0)
+        if have >= BLOODLUST_NEED:
+            return
+        have = min(BLOODLUST_NEED, have + d)
+        sv["quests"]["blood"] = have
+        self.audio.play("secret", 0.8)
+        if have >= BLOODLUST_NEED:
+            self.pop("BLOODLUST DESTROYED  (%d of %d).   Something in the MOTHERBOARD has noticed you..." % (have, BLOODLUST_NEED), (255, 60, 80), 6.0)
+        else:
+            self.pop("BLOODLUST DESTROYED   (%d of %d)" % (have, BLOODLUST_NEED), (255, 60, 80), 3.5)
+        self.store()
+
+    def shadow_check(self, w):
+        """the shadow man shows himself on the Motherboard (Insane, wave 5) to somebody who has destroyed three Bloodlusts"""
+        sv = self.save
+        if w is None or getattr(w, "vs", None) is not None or w.mapid != "board" or w.diff != "insane":
+            return
+        if self.level() <= 21 or sv["quests"].get("blood", 0) < BLOODLUST_NEED:
+            return
+        if self.net or isinstance(w, GuestWorld):
+            # with friends he does not stand on the map (you cannot walk off and leave them): he finds you, and waits under EVENTS
+            bf = sv["bf"]
+            if w.wave >= 5 and not bf.get("called") and not bf.get("yes"):
+                bf["called"] = True
+                self.audio.play("secret", 0.8)
+                self.pop("A SHADOW HAS FOUND YOU.   After the match, go to EVENTS.", (255, 60, 80), 7.0)
+                self.store()
+            return
+        if any(n["id"] == "bf.shadow" for n in w.npcs):
+            return
+        if max(w.wave, sv["best"].get("board:insane", 0)) < 5 or w.wave < 1:
+            return
+        x, y = SHADOW_AT
+        n = dict(id="bf.shadow", name="???", x=(x + 0.5) * CELL, y=(y + 0.5) * CELL, hat="shadow", col=(26, 24, 34), lines=[], quest=None, rad=9, act="shadow")
+        n["z"] = w.surf(n["x"], n["y"], 0.0)
+        w.npcs.append(n)
+        w.burst(n["x"], n["y"], (255, 40, 60), 24, 120, 0.8, 3, 20)
+
+    def bf_lines(self):
+        """what the shadow says: the first time, and when you come back"""
+        bf = self.save["bf"]
+        if bf.get("yes"):
+            return ["The door is open. Go through when you are ready.", "Mind your step. The floor is not kind."]
+        if bf.get("met"):
+            return ["You came back.", "He is still down there. Still building. Still angry."]
+        return ["...Three of my little red friends. Gone.", "Do not be afraid. I am only a shadow. I have been watching you since the fifth wave.",
+                "I need somebody who can fight. Somebody who does not run.", "Come. Let me show you what I see."]
+
+    def npc_act(self, n):
+        if n.get("act") == "shadow":
+            bf = self.save["bf"]
+            if bf.get("yes"):
+                return
+            if bf.get("met"):
+                self.cs_start(choice_only=True)
+            else:
+                self.cs_start()
+
     def next_talk(self):
         if self.talk is None:
             return
         self.talk[1] += 1
         if self.talk[1] >= len(self.talk[0]["lines"]):
+            n = self.talk[0]
             self.talk = None
+            if n.get("act"):
+                self.npc_act(n)
         else:
             self.audio.play("talk", 0.7)
 
@@ -14340,6 +17683,31 @@ class Game:
         mx, my = FW / 2.0 * (1 - 1 / self.z2), FH / 2.0 * (1 - 1 / self.z2)
         self.p2[0] = clamp(self.p2[0], FW / 2.0 - mx, FW / 2.0 + mx)
         self.p2[1] = clamp(self.p2[1], FH / 2.0 - my, FH / 2.0 + my)
+
+    def orb_input(self, w, P):
+        """the orb's own powers: hold the shot key to fire at the mouse, the dash key to zip forward and shove enemies back"""
+        self.orb_t -= self.dt
+        guest = self.net is not None and self.net[0] == "guest"
+        if self.kh("orbshot") and self.orb_t <= 0 and P.ocd <= 0 and self.gpos is not None and not self.over_hud():
+            if self.act("orb", self.gpos[0], self.gpos[1]):
+                self.orb_t = 0.1
+                if guest:
+                    P.ocd = ORB_CD / (1.0 + P.mods["orbrate"])
+        if self.kp("dash") and P.dcd <= 0 and self.view3d():
+            f = int(self.kh("up")) - int(self.kh("down"))
+            sd = int(self.kh("right")) - int(self.kh("left"))
+            dx = dy = 0.0
+            if f or sd:
+                cy, sy = math.cos(self.cyaw), math.sin(self.cyaw)
+                dx, dy = cy * f - sy * sd, sy * f + cy * sd
+            elif self.gpos is not None:
+                dx, dy = self.gpos[0] - P.x, self.gpos[1] - P.y
+            n = math.hypot(dx, dy)
+            if n > 0.01 and self.act("dash", dx, dy):
+                self.dash = [dx / n, dy / n, DASH_TIME]
+                self.audio.play("jump", 0.5)
+                if guest:
+                    P.dcd = DASH_CD * (1.0 - min(0.6, P.mods["dashcd"]))
 
     def camera_input(self, w, P, free):
         kh = self.kh
@@ -14436,6 +17804,14 @@ class Game:
             if (px != P.x or py != P.y) and w.walk_ok(px, py, w.surf(px, py, P.z)):
                 P.x, P.y = px, py
             P.z = w.surf(P.x, P.y, P.z)
+        if self.dash is not None:
+            dd = self.dash
+            step = DASH_DIST / DASH_TIME * dt
+            P.x, P.y, P.z = w.walk(P.x, P.y, P.z, clamp(P.x + dd[0] * step, -40, FW + 40), clamp(P.y + dd[1] * step, -40, FH + 40), ORB_R, self.pass_t <= 0)
+            w.burst(P.x, P.y, mix_col(P.col, WHITE, 0.4), 2, 40, 0.3, 3, P.z + 6, False)
+            dd[2] -= dt
+            if dd[2] <= 0:
+                self.dash = None
         if want > 0 and math.hypot(P.x - ox, P.y - oy) < want * 0.2:
             self.stuck_t += dt
             if self.stuck_t > 0.6:
@@ -14521,9 +17897,18 @@ class Game:
                         break
         return max(0.0, d - w.build_t)
 
+    def vs_step(self, w):
+        """the host runs everybody's map: this moves the other players' worlds on by one step"""
+        V = self.vsm
+        for o in V.worlds:
+            if o is not w:
+                o.update(min(self.dt, 1 / 30.0))
+                del o.ev[:]
+        V.judge()
+
     def mp_auto(self, w):
         """the host calls this every frame"""
-        if len(w.players) < 2 or isinstance(w, GuestWorld):
+        if not w.team() or isinstance(w, GuestWorld):
             return
         left = self.mp_wave_left(w)
         if w.phase == "build" and left <= 0 and "MP_WAVE_DELAY" not in globals():
@@ -14572,6 +17957,14 @@ class Game:
             else:
                 self.typing = ""
             return
+        if self.watching():
+            # only looking: chat, the send keys, and a way back
+            if K.K_ESCAPE in pr:
+                self.watch_stop()
+            for i in range(len(VS_SENDS)):
+                if K.K_F1 + i in pr:
+                    self.act("send", i)
+            return
         if K.K_ESCAPE in pr:
             if self.talk:
                 self.talk = None
@@ -14603,8 +17996,8 @@ class Game:
             if w.phase != "build":
                 if not self.net:
                     self.set_speed()        # alone, while a wave runs, the same key changes the speed
-            elif len(w.players) > 1:
-                self.say("With friends the next wave starts by itself", GREY)
+            elif w.team():
+                self.say("The next wave starts by itself", GREY)
             else:
                 self.act("ready")
         if kp("speed"):
@@ -14615,6 +18008,12 @@ class Game:
             self.toggle_aim(1)
         if kp("tabil"):
             self.do_ability()
+        if w.vs is not None:
+            for i in range(len(VS_SENDS)):
+                if K.K_F1 + i in pr:
+                    self.act("send", i)
+        if getattr(w, "orb_on", False):
+            self.orb_input(w, P)
         if kp("upgrade"):
             self.do_upgrade()
         if kp("mode"):
@@ -14677,6 +18076,83 @@ class Game:
                 else:
                     self.sel = None
 
+    # ------------------------------------------------------------ versus: looking at somebody else's map
+    def watching(self):
+        return self.watch_k is not None and self.world is not None and self.world.vs is not None
+
+    def watch_start(self, k):
+        w = self.world
+        info = (w.vs.get("info") or []) if w is not None and w.vs is not None else []
+        if not (0 <= k < len(info)) or k == w.vs.get("i", 0):
+            return
+        self.watch_k = k
+        self.build = None
+        self.aim = None
+        self.sel = None
+        if self.net and self.net[0] == "guest":
+            self.net[1].send(dict(t="watch", k=k))
+
+    def watch_stop(self):
+        self.watch_k = None
+        if self.net and self.net[0] == "guest":
+            self.net[1].send(dict(t="watch", k=-1))
+
+    def spec_view(self, w):
+        """-> (the world, the player) being watched, or None"""
+        k = self.watch_k
+        if k is None or w.vs is None:
+            return None
+        if self.vsm is not None:
+            if not 0 <= k < len(self.vsm.worlds):
+                return None
+            sw = self.vsm.worlds[k]
+        else:
+            sw = self.spec_worlds.get(k)
+            if sw is None:
+                info = w.vs.get("info") or []
+                if not (0 <= k < len(info)) or self.match_args is None:
+                    return None
+                spec = self.safe_spec(dict(name=info[k][0], col=list(info[k][1])[:3]))
+                sw = GuestWorld(self.match_args[0], self.match_args[1], [spec])
+                sw.vs = dict(i=k, info=[], inc=0)
+                sw.nwaves = VS_WAVES
+                sw.numbers = w.numbers
+                self.spec_worlds[k] = sw
+        sw.numbers = w.numbers
+        return sw, sw.players[0]
+
+    def draw_watch_hud(self, s, w, P, sw, SP):
+        hr = self.hud_rects
+        top = pygame.Rect(0, 0, W, 54)
+        hr.append(top)
+        panel(s, top, (8, 10, 24), 215, ORANGE, 0, 0)
+        pygame.draw.line(s, ORANGE, (0, 54), (W, 54), 2)
+        draw_text(s, "WATCHING", 15, ORANGE, 18, 13, "l")
+        draw_text(s, SP.name, 30, SP.col, 18, 37, "l")
+        draw_text(s, "WAVE", 15, DIM, 250, 13, "l")
+        draw_text(s, "%d" % sw.wave, 34, WHITE, 250, 36, "l")
+        draw_text(s, "CASH", 15, DIM, 330, 13, "l")
+        draw_text(s, "%d" % SP.cash, 34, GOLD, 330, 36, "l")
+        draw_text(s, "CORE", 15, DIM, 470, 13, "l")
+        bar = pygame.Rect(470, 26, 240, 20)
+        f = clamp(sw.hp / float(max(1, sw.maxhp)), 0.0, 1.0)
+        pygame.draw.rect(s, (30, 12, 20), bar, border_radius=7)
+        pygame.draw.rect(s, GREEN if f > 0.5 else GOLD if f > 0.25 else RED, (bar.x, bar.y, int(bar.w * f), bar.h), border_radius=7)
+        pygame.draw.rect(s, LINE, bar, 2, border_radius=7)
+        draw_text(s, "%d / %d" % (max(0, sw.hp), sw.maxhp), 18, WHITE, bar.centerx, bar.centery)
+        draw_text(s, "FOES", 15, DIM, 740, 13, "l")
+        draw_text(s, "%d" % sw.hostiles(), 34, PINK if sw.hostiles() else DIM, 740, 36, "l")
+        draw_text(s, "TOWERS", 15, DIM, 820, 13, "l")
+        draw_text(s, "%d" % len(sw.towers), 34, CYAN, 820, 36, "l")
+        draw_text(s, "YOUR CASH", 15, DIM, 920, 13, "l")
+        draw_text(s, "%d" % P.cash, 34, GOLD, 920, 36, "l")
+        if self.button("wback", pygame.Rect(1084, 10, 180, 36), "BACK  (ESC)", CYAN, 18):
+            self.watch_stop()
+            return
+        if not getattr(sw, "got", True):
+            draw_text(s, "Getting their map...", 26, GREY, W // 2, H // 2)
+        self.draw_versus(s, w, P, 70, hr)
+
     # ------------------------------------------------------------ Wi-Fi
     def host_pump(self, w):
         Hh = self.net[1]
@@ -14686,17 +18162,28 @@ class Game:
             c.pump()
             c.close()
         Hh.new = []
+        V = self.vsm
         for pid, c in list(Hh.conns.items()):
+            ww, wp = (V.worlds[pid], 0) if (V is not None and 0 <= pid < len(V.worlds)) else (w, pid)
             for m in c.pump():
                 t = m.get("t")
                 if t == "act":
                     a = m.get("a")
                     if isinstance(a, list) and a:
-                        w.apply(pid, a)
+                        ww.apply(wp, a)
+                elif t == "watch":
+                    try:
+                        kk = int(m.get("k", -1))
+                    except Exception:
+                        kk = -1
+                    if V is not None and 0 <= kk < len(V.worlds) and kk != pid:
+                        self.watch_of[pid] = kk
+                    else:
+                        self.watch_of.pop(pid, None)
                 elif t == "chat":
                     text = clean_chat(m.get("text", ""), CHAT_MAX + 16)
-                    if text and 0 <= pid < len(w.players):
-                        q = w.players[pid]
+                    if text and 0 <= wp < len(ww.players):
+                        q = ww.players[wp]
                         bad = self.chat_add(q.name, q.col, text, q.title)       # filtered again here, whatever the sender did
                         text = self.chat[-1][2]
                         self.audio.play("censor2" if bad else "chat")
@@ -14705,26 +18192,41 @@ class Game:
                                 c2.send(dict(t="chat", name=q.name, col=list(q.col), title=q.title, text=text))
             if c.dead:
                 del Hh.conns[pid]
-                if 0 <= pid < len(w.players):
-                    q = w.players[pid]
+                if 0 <= wp < len(ww.players):
+                    q = ww.players[wp]
                     q.here = False
                     q.ready = True
                     self.chat_add("", GREY, "%s left the game" % q.name)
-                    if w.phase == "cards" and q.offer:
-                        w.pick_card(q, 0)
+                    if V is not None and ww.phase != "over":
+                        ww.phase = "over"            # their core is gone with them
+                        ww.result = "lose"
+                    if ww.phase == "cards" and q.offer:
+                        ww.pick_card(q, 0)
         self.net_t -= self.dt
         if self.net_t <= 0:
             self.net_t = 1.0 / SNAP_HZ
-            fx = w.fxlog
-            w.fxlog = []
+            worlds = V.worlds if V is not None else [w]
+            fxs = []
+            for ow in worlds:
+                fxs.append(ow.fxlog)
+                ow.fxlog = []
             # the others see your orb where it is drawn: in the air while you jump
             me = w.players[self.me] if 0 <= self.me < len(w.players) else None
-            jz = self.jump_z if me is not None else 0.0
+            jz = self.jump_z if (me is not None and V is None) else 0.0
             if jz:
                 me.z += jz
             try:
                 for pid, c in Hh.conns.items():
-                    c.send(world_snap(w, pid, fx))
+                    if V is not None:
+                        wi = pid if 0 <= pid < len(worlds) else 0
+                        c.send(world_snap(worlds[wi], 0, fxs[wi]))
+                        kk = self.watch_of.get(pid)
+                        if kk is not None and 0 <= kk < len(worlds) and kk != wi:
+                            sm = world_snap(worlds[kk], 0, fxs[kk])
+                            sm["sp"] = kk
+                            c.send(sm)
+                    else:
+                        c.send(world_snap(w, pid, fxs[0]))
             finally:
                 if jz:
                     me.z -= jz
@@ -14735,7 +18237,12 @@ class Game:
             t = m.get("t")
             try:
                 if t == "snap":
-                    w.apply_snap(m)
+                    if m.get("sp") is not None:
+                        sw = self.spec_worlds.get(m["sp"])
+                        if sw is not None and self.watch_k == m["sp"]:
+                            sw.apply_snap(m)
+                    else:
+                        w.apply_snap(m)
                 elif t == "chat":
                     self.got_chat(m)
                 elif t == "bye":
@@ -14744,7 +18251,7 @@ class Game:
                     self.room = m
                     self.me_room = int(m.get("you", 0))
                 elif t == "start":
-                    self.start_guest(m["map"], m["diff"], m["specs"], int(m["me"]))
+                    self.guest_start(m)
                     return
             except Exception:
                 pass
@@ -14777,13 +18284,20 @@ class Game:
         P = w.players[self.me]
         guest = isinstance(w, GuestWorld)
         overlay = self.paused or w.phase == "over" or (w.phase == "cards" and P.offer)
+        sv_ = None
+        if self.watching():
+            sv_ = self.spec_view(w)
+            if sv_ is None or overlay:
+                self.watch_stop()
+                sv_ = None
+        watch = sv_ is not None
         self.set_camera(w, P)
         mx, my = self.mouse
-        self.gpos = None if (self.cine or overlay) else self.scene.ground_pick(w, self.cam, mx, my)
+        self.gpos = None if (self.cine or overlay or watch) else self.scene.ground_pick(w, self.cam, mx, my)
         self.hov = None
         self.hov_e = None
         self.hov_p = None
-        if not overlay and not self.cine and not self.over_hud() and not self.build and self.aim is None:
+        if not overlay and not watch and not self.cine and not self.over_hud() and not self.build and self.aim is None:
             self.hov = self.scene.pick_tower(w, self.cam, mx, my)
             if self.hov is None:
                 self.hov_e = self.scene.pick_enemy(w, self.cam, mx, my)
@@ -14803,12 +18317,17 @@ class Game:
             if self.net:
                 self.guest_pump(w, P)
             w.update(self.dt)
+            if watch:
+                sv_[0].update(self.dt)
+                del sv_[0].ev[:]
         else:
             if self.net:
                 self.host_pump(w)
             if not self.paused or self.net:
                 for _ in range(self.speed):
                     w.update(min(self.dt, 1 / 30.0))
+                    if self.vsm is not None:
+                        self.vs_step(w)
                 self.mp_auto(w)
             if w.phase == "build" and st["auto"] and not self.net:
                 self.auto_t += self.dt
@@ -14819,6 +18338,8 @@ class Game:
         for name, vol in w.ev:
             self.audio.play(name, vol)
         del w.ev[:]
+        self.bl_progress(w)
+        self.shadow_check(w)
         for q in list(w.flags):
             ev = QUEST_EVENT.get(q)
             if ev and ev not in self.save["events"]:
@@ -14836,7 +18357,10 @@ class Game:
         if w.phase != "cards":
             self.card_t = 0.0
         # ---- draw
-        self.set_camera(w, P)
+        if watch:
+            self.set_camera(sv_[0], sv_[1])
+        else:
+            self.set_camera(w, P)
         o = dict(t=w.time, detail=st["detail"], me=P, hover=self.hov, sel=self.sel, ranges=st["ranges"], boxes=st["boxes"], names=st["names"],
                  players=True, core_col=w.players[0].col, core_skin=self.save["skin"], seen=self.save["npcs"], shake=st["shake"] and not self.paused,
                  orb=(P.x, P.y), ehp=st["ehp"], ehover=self.hov_e)
@@ -14862,7 +18386,16 @@ class Game:
         if self.aim is not None and self.gpos is not None and not overlay and self.aim < len(P.abils):
             ab = P.abils[self.aim]
             o["aim"] = (ab, self.gpos[0], self.gpos[1], ABILS[ab]["rad"] * (1 + P.mods["splash"] * 0.5))
-        self.scene.draw(s, w, self.cam, o)
+        if watch:
+            sw, SP = sv_
+            if self.spec_scene is None:
+                self.spec_scene = PlayScene()
+            o2 = dict(t=sw.time, detail=st["detail"], me=SP, hover=None, sel=None, ranges=False, boxes=st["boxes"], names=st["names"],
+                      players=True, core_col=sw.players[0].col, core_skin=self.save["skin"], seen=self.save["npcs"], shake=False,
+                      orb=(SP.x, SP.y), ehp=st["ehp"], ehover=None)
+            self.spec_scene.draw(s, sw, self.cam, o2)
+        else:
+            self.scene.draw(s, w, self.cam, o)
         self.hud_rects = []
         if self.cine:
             draw_text(s, "CINEMATIC   -   %s fly    %s / %s down / up    drag the mouse to look    SHIFT faster    SHIFT + P to leave" %
@@ -14873,7 +18406,12 @@ class Game:
             return
         self.draw_banner(s, w)
         self.lock = bool(overlay)
-        self.draw_hud(s, w, P)
+        if watch:
+            self.draw_watch_hud(s, w, P, sv_[0], sv_[1])
+        else:
+            self.draw_hud(s, w, P)
+            if getattr(w, "bf", None):
+                self.draw_bf_hud(s, w)
         self.lock = False
         if w.phase == "cards" and P.offer:
             self.draw_cards(s, w, P)
@@ -14886,7 +18424,7 @@ class Game:
         b = w.banner
         if b:
             f = b[2] / b[3]
-            y = 150 - ease_out(min(1.0, (1 - f) * 5)) * 20
+            y = (200 if getattr(w, 'bf', None) else 150) - ease_out(min(1.0, (1 - f) * 5)) * 20
             if f > 0.25:
                 draw_glow_text(s, b[0], 60, b[1], W // 2, y)
             else:
@@ -14902,7 +18440,93 @@ class Game:
             pygame.draw.rect(s, WHITE, r, 2, border_radius=6)
             draw_text(s, "%s    %d / %d" % (e.name, max(0, e.hp), e.max), 17, WHITE, r.centerx, r.bottom + 11)
 
+    def draw_bf_hud(self, s, w):
+        bf = w.bf
+        ph = bf.get("ph", 0)
+        # ---- the clock
+        if ph in (1, 2):
+            tm = max(0.0, bf["timer"])
+            hurry = tm < 60
+            c = RED if hurry and int(self.time * 4) % 2 == 0 else ORANGE if tm < 120 else WHITE
+            R = pygame.Rect(W // 2 - 150, 104, 300, 44)
+            panel(s, R, (24, 6, 10), 225, c, 10, 2)
+            draw_text(s, "%d:%02d" % (tm // 60, tm % 60), 34, c, R.centerx, R.y + 20)
+            draw_text(s, "PHASE %d   -   KILL THE BOSS BEFORE IT HITS ZERO" % ph if False else ("PHASE 1: DESOLATION" if ph == 1 else "PHASE 2: THE SCARECROW"), 12, GREY, R.centerx, R.bottom - 7)
+            if ph == 2 and bf.get("stars"):
+                draw_text(s, "STARS!  Stand on a star for 3 seconds. Each one you miss gives him +%dk." % (BF_STAR_HEAL // 1000), 17, (255, 230, 90), W // 2, R.bottom + 20)
+            elif ph == 2 and bf.get("ms"):
+                draw_text(s, "Stars missed: %d   (+%dk each)" % (bf["ms"], BF_STAR_HEAL // 1000), 14, (255, 150, 130), W // 2, R.bottom + 16)
+        # ---- the voice
+        txt = bf.get("vox") or ""
+        if txt and bf.get("vt", 0) > 0:
+            if getattr(self, "vox_txt", None) != txt:
+                self.vox_txt = txt
+                self.vox_t0 = self.time
+            rg = clamp(bf.get("rage", 0), 0, 4)
+            n = int((self.time - self.vox_t0) * (34 + rg * 8))
+            shown = txt[:n]
+            rnd = random.Random(int(self.time * 20))
+            jit = (rg * 0.6) if rg >= 3 else 0.0
+            R = pygame.Rect(14, 66, 340, 108)
+            hot = mix_col((200, 190, 205), (255, 40, 52), rg / 4.0)
+            panel(s, R, mix_col((10, 6, 12), (40, 4, 8), rg / 4.0), 235, hot, 12, 2)
+            ox = rnd.uniform(-jit, jit)
+            draw_text(s, "DESOLATION", 17 + rg, hot, R.x + 18 + ox, R.y + 20, "l")
+            for j, ln in enumerate(wrap(shown, 20 + (rg >= 3), R.w - 36)[:3]):
+                draw_text(s, ln, 20 + (rg >= 3), WHITE if rg < 3 else (255, 190, 190), R.x + 18 + rnd.uniform(-jit, jit), R.y + 50 + j * 24, "l")
+            if rg >= 4 and rnd.random() < 0.25:
+                pygame.draw.rect(s, (255, 40, 60), (R.x, R.y + rnd.randrange(R.h), R.w, 2))
+
     # ------------------------------------------------------------ the HUD
+    def draw_versus(self, s, w, P, y0, hr):
+        """versus: how the other cores are doing (click one to watch their map), and the buttons that send enemies their way"""
+        info = w.vs.get("info") or []
+        me = w.vs.get("i", 0)
+        RH = 34
+        hr.append(pygame.Rect(W - 262, y0 - 12, 252, RH * len(info) + 2))
+        for k, row in enumerate(info):
+            name, col, hp, mx, wv, alive = row[:6]
+            yy = y0 + k * RH
+            rr = pygame.Rect(W - 262, yy - 12, 250, RH - 2)
+            seen = self.watch_k == k
+            hov = k != me and not self.lock and rr.collidepoint(self.mouse)
+            if seen or hov:
+                panel(s, rr, PANEL, 200, ORANGE if seen else LINE, 6, 1)
+            pygame.draw.circle(s, tuple(col)[:3] if alive else DIM, (W - 250, yy), 6)
+            draw_text(s, name + ("  (you)" if k == me else ""), 16, WHITE if k == me else GREY, W - 238, yy, "l")
+            f = hp / float(max(1, mx))
+            draw_text(s, ("%d / %d   W%d" % (hp, mx, wv)) if alive else "OUT", 15, (GREEN if f > 0.5 else GOLD if f > 0.25 else RED) if alive else DIM, W - 14, yy, "r")
+            if len(row) >= 11:
+                if k == me:
+                    det = "cash %d   towers %d" % (P.cash, row[7])
+                else:
+                    det = "cash %d  towers %d  foes %d" % (row[6], row[7], row[8])
+                draw_text(s, det, 12, DIM if not alive else mix_col(GREY, WHITE, 0.2), W - 238, yy + 14, "l")
+                if k != me and (hov or seen):
+                    draw_text(s, "WATCHING" if seen else "WATCH", 12, ORANGE, W - 14, yy + 14, "r")
+                elif k != me and row[9]:
+                    draw_text(s, "%d coming" % row[9], 12, ORANGE, W - 14, yy + 14, "r")
+            if hov and self.click:
+                self.click = False
+                self.audio.play("click")
+                if seen:
+                    self.watch_stop()
+                else:
+                    self.watch_start(k)
+        others = any(row[5] for k, row in enumerate(info) if k != me)
+        R = pygame.Rect(W - 262, y0 + RH * len(info) + 4, 250, 28 + 38 * len(VS_SENDS))
+        hr.append(R)
+        panel(s, R, PANEL, 225, ORANGE, 10, 2)
+        draw_text(s, "SEND THEM ENEMIES", 15, ORANGE, R.x + 12, R.y + 14, "l")
+        draw_text(s, "income +%d" % w.vs.get("inc", 0), 13, GREY, R.right - 10, R.y + 14, "r")
+        for i, (lab, kind, n, base, gap, need) in enumerate(VS_SENDS):
+            b = pygame.Rect(R.x + 8, R.y + 28 + i * 38, R.w - 16, 35)
+            cost = vs_cost(w.wave, i)
+            open_ = w.wave >= need
+            ok = open_ and P.cash >= cost and w.phase != "over" and others
+            if self.button("vs%d" % i, b, "F%d  %s  x%d" % (i + 1, lab, n), ORANGE if ok else GREY, 15, ok, ("%d cash" % cost) if open_ else "from wave %d" % need):
+                self.act("send", i)
+
     def draw_hud(self, s, w, P):
         st = self.save["settings"]
         guest = isinstance(w, GuestWorld)
@@ -14914,7 +18538,8 @@ class Game:
         pygame.draw.line(s, LINE, (0, 54), (W, 54), 2)
         draw_text(s, "WAVE", 15, DIM, 18, 13, "l")
         r = draw_text(s, "%d" % w.wave, 34, WHITE, 18, 36, "l")
-        draw_text(s, "/ %d" % w.nwaves, 20, GREY, r.right + 6, 39, "l")
+        if w.vs is None and w.diff != "endless":
+            draw_text(s, "/ %d" % w.nwaves, 20, GREY, r.right + 6, 39, "l")
         draw_text(s, w.D["name"], 15, w.D["col"], 66, 13, "l")
         self.cash_show += (P.cash - self.cash_show) * min(1.0, self.dt * 12)
         draw_text(s, "CASH", 15, DIM, 176, 13, "l")
@@ -14956,7 +18581,9 @@ class Game:
             self.draw_radar(s, w, P, MM)
             py0 = 214
         # ---- other players
-        if len(w.players) > 1:
+        if w.vs is not None:
+            self.draw_versus(s, w, P, py0, hr)
+        elif len(w.players) > 1:
             for i, q in enumerate(w.players):
                 y = py0 + i * 22
                 pygame.draw.circle(s, q.col if q.here else DIM, (W - 250, y), 6)
@@ -15016,7 +18643,7 @@ class Game:
         S = pygame.Rect(W - 202, H - 98, 190, 88)
         hr.append(S)
         if w.phase == "build":
-            if len(w.players) > 1:
+            if w.team():
                 # with friends nobody readies up: the next wave starts by itself
                 left = self.mp_wave_left(w)
                 panel(s, S, mix_col(PANEL, GREEN, 0.10), 232, GREEN, 10, 2)
@@ -15045,6 +18672,16 @@ class Game:
             else:
                 sub = "BOSS WAVE: NO SKIPPING" if (w.cur and w.cur.get("boss")) else why.upper() if why.startswith("Skip") else "FINAL WAVE" if why.startswith("This") else ""
                 self.button("start", S, "WAVE %d" % w.wave, GREY, 24, False, sub, alpha=232)
+        if getattr(w, "orb_on", False) and w.phase != "over":
+            for i, (act, lab, cd, tot, col) in enumerate((("orbshot", "SHOT", P.ocd, ORB_CD / (1.0 + P.mods["orbrate"]), P.col),
+                                                          ("dash", "DASH", P.dcd, DASH_CD * (1.0 - min(0.6, P.mods["dashcd"])), CYAN))):
+                C = pygame.Rect(W - 382 + i * 88, H - 126, 84, 22)
+                hr.append(C)
+                ready = cd <= 0
+                panel(s, C, PANEL, 215, col if ready else LINE, 7, 1)
+                draw_text(s, "%s %s" % (self.kname(act), lab), 12, WHITE if ready else GREY, C.centerx, C.centery - 1)
+                if not ready:
+                    pygame.draw.rect(s, col, (C.x + 5, C.bottom - 4, int((C.w - 10) * (1 - clamp(cd / max(0.01, tot), 0, 1))), 2))
         for i in range(2):
             A = pygame.Rect(W - 382, H - 98 + i * 46, 172, 42)
             hr.append(A)
@@ -15164,15 +18801,26 @@ class Game:
         pygame.draw.rect(s, scale_col(mix_col(col, LINE, 0.5), k), fr, 1, border_radius=8)
         self.draw_orb(s, pc[0], pc[1], pr, col, k)
         nr = draw_text(s, name, 18 if big else 15, scale_col(col, k), r.x + tx, r.y + (16 if big else 13), "l")
+        mood = e[6] if len(e) > 6 else "calm"
+        M = MOODS.get(mood) or MOODS["calm"]
         if e[4]:
-            draw_text(s, e[4], 13 if big else 12, scale_col(GOLD, k), nr.right + 8, r.y + (17 if big else 14), "l")
+            nr = draw_text(s, e[4], 13 if big else 12, scale_col(GOLD, k), nr.right + 8, r.y + (17 if big else 14), "l")
+        if M["verb"]:
+            draw_text(s, M["verb"], 12 if big else 11, scale_col(mix_col(M["tint"], col, 0.15), k), nr.right + 8, r.y + (17 if big else 14), "l")
+        mage = self.time - e[3]
         left = shown
         for j, ln in enumerate(lines):
             if left <= 0:
                 break
             n = rich_len(ln)
-            draw_rich(s, ln if left >= n else rich_cut(ln, left), fs, scale_col(WHITE, k), r.x + tx, r.y + head + lh * j + lh // 2 - 1, k)
+            part = ln if left >= n else rich_cut(ln, left)
+            if mood == "calm":
+                draw_rich(s, part, fs, scale_col(WHITE, k), r.x + tx, r.y + head + lh * j + lh // 2 - 1, k)
+            else:
+                draw_mood(s, part, fs, WHITE, r.x + tx, r.y + head + lh * j + lh // 2 - 1, k, mood, self.time, mage, i0=j * 40)
             left -= n + 1
+        if mood != "calm" and GFX.get("glow", True):
+            draw_mood_fx(s, mood, r, self.time, mage, k if big else k * 0.7, id(e) // 16 & 0xFFFF)
         return r
 
     def draw_chat_stack(self, s, P):
@@ -15243,7 +18891,7 @@ class Game:
             k *= min(1.0, 0.3 + age / 0.22)
             if k < 0.04:
                 continue
-            r = self.draw_chat_box(s, e, x0 + int(slide), int(y), w2, lvl, k, lines, int(age * 44) if e[0] else 999)
+            r = self.draw_chat_box(s, e, x0 + int(slide), int(y), w2, lvl, k, lines, int(age * (MOODS.get(e[6] if len(e) > 6 else 'calm') or MOODS['calm'])['speed']) if e[0] else 999)
             right = max(right, r.right)
             bottom = ty - 6
         return right
@@ -15285,7 +18933,7 @@ class Game:
         elif w.wave == 0 and not w.towers:
             txt = "Pick a tower at the bottom left (keys %s-%s), then click the ground next to the road." % (kn("slot1"), kn("slot%d" % len(P.loadout)))
         elif w.phase == "build" and w.wave < 3:
-            txt = ("The next wave starts by itself." if len(w.players) > 1 else "%s starts the wave." % kn("start")) + \
+            txt = ("The next wave starts by itself." if w.team() else "%s starts the wave." % kn("start")) + \
                   "   Point at a tower:  %s upgrade   %s sell   %s target   %s ability.   %s chats." % (kn("upgrade"), kn("sell"), kn("mode"), kn("tabil"), kn("chat"))
         if txt:
             fs = self.fit_size(txt, 18, W - 40 - (chat_right + 8 if chat_right else 0), 13)
@@ -15411,6 +19059,18 @@ class Game:
             if self.button("tabil", pygame.Rect(R.x + 10, by, R.w - 20, 28), lab, RED if ready else GREY, self.fit_size(lab, 16, R.w - 34), ready):
                 self.sel = t
                 self.do_ability()
+        if t.kind == "summoner":
+            sy = by - 34 if t.lv >= MAXLV else by
+            lab = "%s   SENDS: %s" % (self.kname("mode"), SQUADS[t.mode if t.mode < min(5, t.lv + 1) else 0]) if t.lv >= 1 else "LEVEL 2: SHIELD GOONS"
+            if self.button("tmode", pygame.Rect(R.x + 10, sy, R.w - 20, 28), lab, CYAN if t.lv >= 1 else GREY, self.fit_size(lab, 16, R.w - 34), t.lv >= 1):
+                self.act("mode", t.id)
+        if t.kind == "summoner" and t.lv >= MAXLV:
+            price = w.king_price(P)
+            ok = t.acd <= 0 and P.cash >= price and w.phase == "wave"
+            lab = "%s  SEND THE KING  %dk" % (self.kname("tabil"), price // 1000) if t.acd <= 0 else "NEXT KING IN %ds" % math.ceil(t.acd)
+            if self.button("tabil", pygame.Rect(R.x + 10, by, R.w - 20, 28), lab, GOLD if ok else GREY, self.fit_size(lab, 16, R.w - 34), ok):
+                self.sel = t
+                self.do_ability()
         c = w.up_cost(t)
         U = pygame.Rect(R.x + 10, R.bottom - 56, 126, 46)
         if c is None:
@@ -15452,7 +19112,7 @@ class Game:
         lk = w.leak_of(e)
         final = lk >= 999
         deadly = final or lk >= w.hp
-        lines = [(e.name, 17, e.col), ("HP  %d / %d" % (max(0, math.ceil(e.hp)), e.max), 16, WHITE)]
+        lines = [(e.name + ("   FLIES" if e.air else ""), 17, e.col), ("HP  %d / %d" % (max(0, math.ceil(e.hp)), e.max), 16, WHITE)]
         if e.smax > 0:
             lines.append(("SHIELD  %d / %d" % (max(0, e.shield), e.smax), 14, BLUE))
         if final:
@@ -15477,6 +19137,8 @@ class Game:
         x = self.chip(T["atk"], PINK, x, R.y + 42, 12)
         if T.get("aoe"):
             x = self.chip("AOE", ORANGE, x, R.y + 42, 12)
+        if kind in GROUND_ONLY or T["atk"] == "PATH":
+            x = self.chip("NO FLYERS", RED, x, R.y + 42, 12)
         draw_text(s, "PLACE: " + PLACE_NAME[T["place"]], 14, PLACE_COL[T["place"]], R.x + 12, R.y + 64, "l")
         y = R.y + 84
         mb = w.map.get("buff", {}).get(kind)
@@ -15523,7 +19185,7 @@ class Game:
         self.dim(s, 170)
         draw_glow_text(s, "SUPPLY DROP", 64, GOLD, W // 2, 96)
         sub = "Wave %d cleared.  Pick one card.  (keys %s)" % (w.wave, " ".join(self.kname("slot%d" % (j + 1)) for j in range(3)))
-        if len(w.players) > 1:
+        if w.team():
             sub += "    %ds" % max(0, w.card_t)
         draw_text(s, sub, 22, GREY, W // 2, 146)
         pick = None
@@ -15575,14 +19237,17 @@ class Game:
         D = w.D
         win = w.result == "win"
         done = w.wave if win else min(max(0, w.wave - 1), w.cleared)      # skipped waves you did not survive do not count
-        coins = D["per"] * done + (D["coins"] if win else 0)
-        xp = D["xp"] * done + (D["xpwin"] if win else 0)
+        paid = min(done, ENDLESS_PAY_CAP) if w.diff == "endless" else done
+        coins = D["per"] * paid + (D["coins"] if win else 0)
+        xp = D["xp"] * paid + (D["xpwin"] if win else 0)
         key = "%s:%s" % (w.mapid, w.diff)
         notes = []
         if win and not sv["stars"].get(key) and D["first"]:
             coins += D["first"]
             notes.append("FIRST CLEAR BONUS  +%d" % D["first"])
         ev = w.map.get("event")
+        if ev == "blood" and win and "blood" not in sv["events"]:
+            sv["events"]["blood"] = time.time()         # fought it with a friend: it is open for you too
         if ev and win:
             E = EVENTS[ev]
             kind = E["tower"]
@@ -15594,10 +19259,47 @@ class Game:
             elif not real and had is None:
                 sv["etowers"][kind] = "ripoff"
                 notes.append("EVENT TOWER EARNED:  %s RIPOFF  (the event was over)" % TOWERS[kind]["name"])
+            if ev == "blood":
+                sv["bf"]["won"] = True
+                notes.insert(0, "THE SHADOW:  \"You did it. Thank you. Be kinder with it than he was.\"")
             if not sv["edone"].get(ev):
                 coins += 500
                 notes.append("EVENT BONUS  +500")
             sv["edone"][ev] = sv["edone"].get(ev, 0) + 1
+        mine = bool(w.map.get("custom")) or w.vs is not None
+        if w.vs is not None:
+            coins = (150 if win else 40) + 8 * done
+            xp = (100 if win else 30) + 6 * done
+            notes = ["VERSUS: coins and XP for how long you lasted" + (" and for winning" if win else "")]
+        elif w.map.get("custom"):
+            coins = xp = 0
+            notes = ["A MAP YOU DREW: no coins or XP here"]
+        dly = getattr(w, "daily", None)
+        if w.diff == "endless" and w.vs is None:
+            if dly:
+                d = sv["daily"]
+                if d.get("date") != dly["date"]:
+                    d.update(date=dly["date"], best=0, plays=0, paid=False)
+                d["plays"] = d.get("plays", 0) + 1
+                if done > d.get("best", 0):
+                    d["best"] = done
+                    if done:
+                        notes.append("TODAY'S BEST:  wave %d" % done)
+                d["top"] = max(d.get("top", 0), done)
+                if not d.get("paid") and done >= DAILY_MIN:
+                    try:
+                        yest = (datetime.date.fromisoformat(dly["date"]) - datetime.timedelta(days=1)).isoformat()
+                    except Exception:
+                        yest = ""
+                    d["streak"] = d.get("streak", 0) + 1 if d.get("last") == yest else 1
+                    d["last"] = dly["date"]
+                    d["paid"] = True
+                    extra = 150 + 25 * min(d["streak"] - 1, 10)
+                    coins += extra
+                    xp += 100
+                    notes.append("DAILY BONUS  +%d coins  (streak: %d day%s)" % (extra, d["streak"], "" if d["streak"] == 1 else "s"))
+            elif done > sv["best"].get(key, 0):
+                notes.append("NEW BEST:  wave %d" % done)
         lv0 = self.level()
         sv["xp"] += xp
         lv1 = self.level()
@@ -15605,12 +19307,13 @@ class Game:
         if bonus:
             notes.append("LEVEL UP BONUS  +%d" % bonus)
         sv["coins"] += coins + bonus
-        if win:
+        if win and not mine:
             sv["stars"][key] = max(sv["stars"].get(key, 0), w.stars)
             sv["stats"]["wins"] += 1
-            if len(w.players) > 1:
+            if len(w.players) > 1 or w.vs is not None:
                 sv["stats"]["mpwins"] = sv["stats"].get("mpwins", 0) + 1
-        sv["best"][key] = max(sv["best"].get(key, 0), done)
+        if not mine and not dly:
+            sv["best"][key] = max(sv["best"].get(key, 0), done)
         sv["stats"]["kills"] += w.players[self.me].kills if len(w.players) > 1 else w.stats["kills"]
         sv["stats"]["towers"] += w.players[self.me].built if not isinstance(w, GuestWorld) else 0
         sv["stats"]["bosses"] += w.stats["bosses"]
@@ -15650,13 +19353,24 @@ class Game:
         R.center = (W // 2, H // 2 + int((1 - u) * 40))
         col = GOLD if rw["win"] else RED
         panel(s, R, PANEL, 245, col, 18, 3)
-        draw_glow_text(s, "TRIUMPH" if rw["win"] else "DEFEAT", 84, col, R.centerx, R.y + 60)
-        draw_text(s, "%s   -   %s   -   %d / %d WAVES" % (w.map["name"], w.D["name"], rw["done"], w.nwaves), 22, GREY, R.centerx, R.y + 114)
-        if rw["win"]:
+        draw_glow_text(s, "TRIUMPH" if rw["win"] else "RUN OVER" if w.diff == "endless" else "DEFEAT", 84, col, R.centerx, R.y + 60)
+        if w.vs is not None:
+            draw_text(s, "VERSUS   -   %s   -   WAVE %d" % (w.map["name"], rw["done"]), 22, GREY, R.centerx, R.y + 114)
+            draw_text(s, "The other cores fell. You are the last one standing." if rw["win"] else "Your core fell on wave %d." % w.wave, 22, WHITE, R.centerx, R.y + 160)
+        else:
+            if w.diff == "endless":
+                tw = TWIST_BY_KEY.get(w.daily["twist"]) if getattr(w, "daily", None) else None
+                draw_text(s, "%s   -   %s   -   %d WAVE%s SURVIVED" % (w.map["name"], "DAILY: " + tw["name"] if tw else "ENDLESS", rw["done"], "" if rw["done"] == 1 else "S"), 22, GREY, R.centerx, R.y + 114)
+            else:
+                draw_text(s, "%s   -   %s   -   %d / %d WAVES" % (w.map["name"], w.D["name"], rw["done"], w.nwaves), 22, GREY, R.centerx, R.y + 114)
+        if w.vs is not None:
+            pass
+        elif rw["win"]:
             for i in range(3):
                 draw_star(s, R.centerx + (i - 1) * 62, R.y + 160, 26, i < w.stars)
         else:
-            draw_text(s, "The host left." if self.over_net else "The core fell on wave %d." % w.wave, 22, WHITE, R.centerx, R.y + 160)
+            timeup = getattr(w, "bf", None) is not None and w.bf.get("timer", 1) <= 0 and w.bf.get("ph") in (1, 2)
+            draw_text(s, "The host left." if self.over_net else "Time ran out. He was still standing." if timeup else "The core fell on wave %d." % w.wave, 22, WHITE, R.centerx, R.y + 160)
         y = R.y + 210
         for lab, val in (("ENEMIES DESTROYED", "%d" % w.stats["kills"]), ("TOWERS BUILT", "%d" % w.stats["built"]),
                          ("LEAKS", "%d" % w.stats["leaks"]), ("TIME", "%d:%02d" % (w.playtime // 60, w.playtime % 60))):
@@ -15702,7 +19416,7 @@ class Game:
                     self.leave_net()
                     self.goto("lobby")
             elif self.button("again", pygame.Rect(R.x + 60, R.bottom - 74, 270, 54), "PLAY AGAIN", col, 28):
-                self.start_game(w.mapid, w.diff)
+                self.start_game(w.mapid, w.diff, daily=getattr(w, "daily", None))
             elif self.button("lobby", pygame.Rect(R.right - 330, R.bottom - 74, 270, 54), "MAIN MENU", CYAN, 26) or P:
                 self.world = None
                 self.goto("lobby")
@@ -15717,7 +19431,9 @@ class Game:
         if self.quit_confirm > 0:
             self.quit_confirm -= self.dt
         items = [("resume", "RESUME", GREEN)]
-        if not self.net:
+        if not self.net and w.diff == "endless":
+            items.append(("end", "END THE RUN (keep rewards)", GOLD))
+        elif not self.net:
             items.append(("restart", "RESTART", GOLD))
         items += [("settings", "SETTINGS", CYAN), ("controls", "CONTROLS", PURPLE), ("help", "HOW TO PLAY", CYAN),
                   ("quit", "REALLY LEAVE? (no rewards)" if self.quit_confirm > 0 else "LEAVE THE GAME" if self.net else "QUIT TO MENU", RED)]
@@ -15727,6 +19443,9 @@ class Game:
                     self.paused = False
                 elif key == "restart":
                     self.start_game(w.mapid, w.diff)
+                elif key == "end":
+                    w.hp = 0
+                    self.paused = False
                 elif key in ("settings", "controls", "help"):
                     self.back_to = "play"
                     self.goto(key)
@@ -16030,6 +19749,1481 @@ class Game:
         if self.button("mguide", pygame.Rect(B.x, B.bottom + 8, B.w, 44), "WATCH THE TUTORIAL", PINK, 17, g is not None, "needs level %d" % g["need"] if g else None):
             self.start_video(m["id"], sv["diff"], "maps")
 
+    # ------------------------------------------------------------ MY MAPS: maps you draw yourself
+    def reload_mymaps(self):
+        """register every map in the save, so the game can play them"""
+        out = []
+        keep = []
+        for c in self.save.get("mymaps", []):
+            c = custom_clean(c)
+            if c is not None and not custom_problem(c):
+                keep.append(c)
+                out.append(custom_map(c))
+        self.save["mymaps"] = keep[:CUSTOM_MAX]
+        self.my_maps = out[:CUSTOM_MAX]
+
+    def my_save(self, c):
+        """put a map into the save (a map with the same name is replaced) -> its place in the list"""
+        L = self.save["mymaps"]
+        for i, o in enumerate(L):
+            if o["name"] == c["name"]:
+                L[i] = c
+                break
+        else:
+            if len(L) >= CUSTOM_MAX:
+                return -1
+            L.append(c)
+            i = len(L) - 1
+        self.store()
+        self.reload_mymaps()
+        return i
+
+    def screen_endless(self, s):
+        self.draw_plain(s)
+        sv = self.save
+        if self.tab_header("endless"):
+            return
+        if self.back_button("lobby"):
+            return
+        lv = self.level()
+        # ---- the daily challenge
+        info = self.daily_info()
+        m = MAP_BY_ID[info["map"]]
+        tw = TWIST_BY_KEY[info["twist"]]
+        th = THEMES[m["theme"]]
+        d = sv["daily"]
+        today_best = d.get("best", 0) if d.get("date") == info["date"] else 0
+        paid = d.get("date") == info["date"] and d.get("paid")
+        D = pygame.Rect(34, 84, W - 68, 206)
+        panel(s, D, PANEL, 255, GOLD, 14, 2)
+        self.draw_minimap(s, m, pygame.Rect(D.x + 16, D.y + 16, 270, 174), th["accent"], False)
+        x = D.x + 312
+        draw_text(s, "TODAY'S DAILY CHALLENGE", 22, GOLD, x, D.y + 28, "l")
+        draw_text(s, info["date"], 18, DIM, D.right - 270, D.y + 28, "r")
+        draw_text(s, m["name"], 34, th["accent"], x, D.y + 64, "l")
+        draw_text(s, "TWIST:  " + tw["name"], 26, tw["col"], x, D.y + 102, "l")
+        for i, ln in enumerate(wrap(tw["text"], 18, 520)[:2]):
+            draw_text(s, ln, 18, GREY, x, D.y + 130 + i * 22, "l")
+        draw_text(s, "Best today: wave %d" % today_best if today_best else "Not played yet today", 17, WHITE if today_best else DIM, x, D.y + 182, "l")
+        draw_text(s, "streak: %d day%s" % (d.get("streak", 0), "" if d.get("streak", 0) == 1 else "s"), 17, MINT, x + 220, D.y + 182, "l")
+        B = pygame.Rect(D.right - 250, D.y + 52, 226, 98)
+        if self.button("daily_go", B, "PLAY", GOLD, 40, True, "daily bonus done" if paid else "reach wave %d for a bonus" % DAILY_MIN):
+            self.store()
+            self.start_game(info["map"], "endless", daily=info)
+            return
+        draw_text(s, "Everybody gets the same map and twist today.", 14, DIM, B.centerx, B.bottom + 24)
+        # ---- endless: pick a map
+        draw_text(s, "ENDLESS  -  no final wave. A boss every 10 waves. How far can you get?", 19, CYAN, W // 2, 312)
+        self.sel_end = clamp(self.sel_end, 0, len(MAIN_MAPS) - 1)
+        for i, mm in enumerate(MAIN_MAPS):
+            r = pygame.Rect(34 + (i % 7) * 174, 332 + (i // 7) * 128, 166, 120)
+            locked = lv < mm["need"]
+            t2 = THEMES[mm["theme"]]
+            on = self.sel_end == i
+            hov = r.collidepoint(self.mouse)
+            pygame.draw.rect(s, mix_col(PANEL, t2["accent"], 0.20 if on else 0.08 if hov else 0.03), r, border_radius=10)
+            pygame.draw.rect(s, WHITE if on else t2["accent"] if hov and not locked else LINE, r, 2, border_radius=10)
+            self.draw_minimap(s, mm, pygame.Rect(r.x + 8, r.y + 8, r.w - 16, 66), t2["accent"], locked)
+            draw_text(s, mm["name"], 16, WHITE if not locked else DIM, r.centerx, r.y + 86)
+            if locked:
+                draw_text(s, "LEVEL %d" % mm["need"], 14, RED, r.centerx, r.y + 106)
+            else:
+                b = sv["best"].get("%s:endless" % mm["id"], 0)
+                draw_text(s, "BEST: WAVE %d" % b if b else "not played", 14, GOLD if b else DIM, r.centerx, r.y + 106)
+            if hov and self.click:
+                self.click = False
+                self.audio.play("click")
+                self.sel_end = i
+        mm = MAIN_MAPS[self.sel_end]
+        locked = lv < mm["need"]
+        b = sv["best"].get("%s:endless" % mm["id"], 0)
+        draw_text(s, "%s   -   %s" % (mm["name"], "best wave %d" % b if b else "not played yet"), 22, WHITE, 60, 640, "l")
+        draw_text(s, "Coins and XP for every wave you survive. You can end a run from the pause menu and keep them.", 15, GREY, 60, 668, "l")
+        if locked:
+            self.button("endless_go", pygame.Rect(W - 34 - 300, 622, 300, 70), "LOCKED", RED, 32, False, "reach level %d" % mm["need"])
+        elif self.button("endless_go", pygame.Rect(W - 34 - 300, 622, 300, 70), "GO ENDLESS", CYAN, 32, True):
+            self.store()
+            self.start_game(mm["id"], "endless")
+            return
+
+    # ------------------------------------------------------------ the cutscene: the shadow shows you the Blood Factory
+    CS_BEATS = [
+        dict(who="SHADOW", text="This is the place I am afraid of. They call it the BLOOD FACTORY.", fx=dict(tubes=0.0, des=0.0)),
+        dict(who="SHADOW", text="Once it built machines to protect the Bastion. Now it builds... other things.", fx=dict(tubes=0.5)),
+        dict(who="SHADOW", text="Creatures. Grown in tanks. Made angry on purpose.", fx=dict(tubes=1.0)),
+        dict(who="DESOLATION", text="TOO QUIET. THE PROTOTYPES ARE STILL TOO QUIET. MAKE THEM ANGRIER.", fx=dict(tubes=1.0, des=0.55, eyes=1.0, alarm=1.0, glitch=0.6, shake=0.5), sfx="boss"),
+        dict(who="SHADOW", text="That is DESOLATION. He calls it science. It is cruelty with a clipboard.", fx=dict(tubes=1.0, des=0.7, eyes=0.5, alarm=0.4, glitch=0.1, shake=0.0)),
+        dict(who="DESOLATION", text="PEACE IS A FLAW IN MY DESIGN. I WILL CORRECT IT.", fx=dict(des=1.0, eyes=1.0, alarm=1.0, glitch=0.7, shake=0.7), sfx="emp"),
+        dict(who="SHADOW", text="Every quiet place he touches goes loud. Every friendly thing he touches goes red.", fx=dict(des=0.5, eyes=0.4, alarm=0.2, glitch=0.0, shake=0.0)),
+        dict(who="SHADOW", text="I cannot stop him from here. I am only a shadow. But I can open a door.", fx=dict(des=0.25, eyes=0.2, alarm=0.0)),
+        dict(who="SHADOW", text="A way in. Through the old pipes, over the broken floor, up to the room where he builds his army.", fx=dict(des=0.15)),
+        dict(who="SHADOW", text="It is dangerous. The floor is not kind, and there is nothing to catch you.", fx=dict(des=0.1)),
+        dict(who="SHADOW", text="Will you help me?", fx=dict(des=0.1, eyes=0.1), choice=True),
+    ]
+    CS_YES = ["Thank you. Stay low. Stay quiet. And watch your step.", "I will be with you. Mostly."]
+    CS_NO = ["I understand. I will not force you.", "The door will stay open... in case you change your mind."]
+
+    def cs_start(self, choice_only=False):
+        beats = [self.CS_BEATS[-1]] if choice_only else self.CS_BEATS
+        if choice_only:
+            beats = [dict(who="SHADOW", text="You came back. Will you help me?", fx=dict(des=0.1, eyes=0.1, tubes=0.4), choice=True)]
+        self.save["bf"]["met"] = True
+        self.store()
+        self.cs = dict(t=0.0, i=0, typed=0.0, beats=beats, fx=dict(tubes=0.0, des=0.0, eyes=0.0, alarm=0.0, glitch=0.0, shake=0.0), out=None, out_t=0.0, lines=None,
+                       blip=0.0, flash=1.0)
+        self.goto("cutscene")
+        self.fade = 0.0
+
+    def cs_next(self):
+        c = self.cs
+        if c["out"] is not None:
+            return
+        b = c["beats"][c["i"]]
+        n = len(b["text"])
+        if c["typed"] < n:
+            c["typed"] = float(n)           # finish the line first
+            return
+        if b.get("choice"):
+            return
+        c["i"] += 1
+        c["typed"] = 0.0
+        nb_ = c["beats"][c["i"]]
+        if nb_.get("sfx"):
+            self.audio.play(nb_["sfx"], 0.8)
+            c["flash"] = 1.0
+
+    def cs_decide(self, yes):
+        c = self.cs
+        bf = self.save["bf"]
+        c["out"] = "yes" if yes else "no"
+        c["out_t"] = 0.0
+        c["typed"] = 0.0
+        c["lines"] = list(self.CS_YES if yes else self.CS_NO)
+        c["li"] = 0
+        self.audio.play("secret" if yes else "click", 0.8)
+        if yes:
+            bf["yes"] = True
+            if "blood" not in self.save["events"]:
+                self.unlock_event("blood")
+        self.store()
+
+    def cs_scene(self, s, t, fx, ox, oy):
+        """the black place: tanks with shapes in them, and DESOLATION behind them"""
+        s.fill((4, 2, 6))
+        pw = fx["tubes"]
+        # back wall: dark pipes
+        for i in range(9):
+            x = 80 + i * 140 + ox * 0.3
+            pygame.draw.rect(s, (14, 8, 12), (x, 0, 18, 540))
+            pygame.draw.rect(s, (30, 12, 16), (x + 4, 0, 4, 540))
+        # the floor: lines running away
+        pygame.draw.polygon(s, (10, 4, 8), [(0, 520 + oy), (W, 520 + oy), (W, H), (0, H)])
+        for i in range(-8, 9):
+            pygame.draw.line(s, (36, 10, 16), (640 + i * 40 + ox * 0.6, 520 + oy), (640 + i * 190 + ox, H), 1)
+        for j in range(5):
+            y = 520 + (j + (t * 0.4) % 1.0) ** 2 * 9 + oy
+            pygame.draw.line(s, (30, 8, 14), (0, y), (W, y), 1)
+        # DESOLATION, tall in the middle, behind the tanks
+        d = fx["des"]
+        if d > 0.01:
+            self.cs_desolation(s, 640 + ox * 0.8, 520 + oy, t, d, fx["eyes"])
+        # the tanks
+        n = 7
+        for i in range(n):
+            cx = 120 + i * 173 + ox
+            self.cs_tank(s, cx, 556 + oy, 92, 300, t, i, pw)
+        # the shadow in front, on the left
+        self.cs_shadow(s, 190 + ox * 1.3, 700 + oy, t)
+
+    def cs_tank(self, s, cx, by, w, h, t, i, pw):
+        if pw <= 0.02:
+            return
+        top = by - h
+        a = int(255 * min(1.0, pw * 1.3))
+        tk = pygame.Surface((w + 20, h + 40), pygame.SRCALPHA)
+        gx, gy = 10, 20
+        pulse = 0.55 + 0.45 * math.sin(t * 1.8 + i * 1.3)
+        liq = mix_col((50, 4, 8), (210, 30, 44), pw * pulse)
+        pygame.draw.rect(tk, liq + (150,), (gx, gy, w, h), border_radius=10)
+        pygame.draw.rect(tk, (255, 120, 130, 60), (gx + 8, gy + 8, 8, h - 24), border_radius=4)
+        # the shape inside
+        kind = i % 3
+        mx, my = gx + w // 2, gy + h - 80 + math.sin(t * 1.1 + i) * 8
+        body = (6, 2, 4, 255)
+        if kind == 0:
+            pygame.draw.ellipse(tk, body, (mx - 26, my - 38, 52, 76))
+            pygame.draw.ellipse(tk, body, (mx - 14, my - 66, 28, 30))
+        elif kind == 1:
+            pygame.draw.polygon(tk, body, [(mx - 30, my + 40), (mx, my - 60), (mx + 30, my + 40), (mx + 10, my + 16), (mx - 10, my + 16)])
+        else:
+            pygame.draw.ellipse(tk, body, (mx - 34, my - 26, 68, 52))
+            for k in range(5):
+                pygame.draw.line(tk, body, (mx - 30 + k * 15, my + 20), (mx - 40 + k * 20, my + 54), 4)
+        if pw > 0.6 and math.sin(t * 3.1 + i * 2.2) > -0.4:
+            for ex in (-9, 9):
+                pygame.draw.circle(tk, (255, 220, 90, 255), (mx + ex, int(my - 20)), 3)
+        for k in range(6):
+            bx = gx + 14 + (k * 37 + i * 11) % (w - 28)
+            by2 = gy + h - ((t * 34 + k * 53 + i * 17) % h)
+            pygame.draw.circle(tk, (255, 190, 190, 120), (bx, int(by2)), 2 + k % 3, 1)
+        pygame.draw.rect(tk, (160, 170, 190, 160), (gx, gy, w, h), 2, border_radius=10)
+        pygame.draw.ellipse(tk, (70, 74, 86, 255), (gx - 8, gy - 10, w + 16, 22))
+        pygame.draw.ellipse(tk, (70, 74, 86, 255), (gx - 8, gy + h - 12, w + 16, 22))
+        tk.set_alpha(a)
+        s.blit(tk, (cx - w // 2 - 10, top - 20))
+        glow(s, cx, top + h * 0.5, h * 0.6, (255, 40, 50), 0.32 * pw * pulse)
+
+    def cs_desolation(self, s, cx, by, t, d, eyes):
+        W2, H2 = 460, 560
+        f = pygame.Surface((W2, H2), pygame.SRCALPHA)
+        m = W2 // 2
+        sway = math.sin(t * 0.9) * 4
+        metal = (30, 28, 38, 255)
+        edge = (80, 20, 26, 255)
+        # legs
+        for sx in (-1, 1):
+            pygame.draw.polygon(f, metal, [(m + sx * 20, 330), (m + sx * 70, 330), (m + sx * 64, 548), (m + sx * 26, 548)])
+            pygame.draw.polygon(f, edge, [(m + sx * 20, 330), (m + sx * 70, 330), (m + sx * 64, 548), (m + sx * 26, 548)], 2)
+        # torso
+        pygame.draw.polygon(f, metal, [(m - 105, 160 + sway * 0.3), (m + 105, 160 + sway * 0.3), (m + 76, 340), (m - 76, 340)])
+        pygame.draw.polygon(f, edge, [(m - 105, 160 + sway * 0.3), (m + 105, 160 + sway * 0.3), (m + 76, 340), (m - 76, 340)], 3)
+        for k in range(5):
+            pygame.draw.line(f, (120, 20, 28, 255), (m - 60, 200 + k * 26), (m + 60, 200 + k * 26), 2)
+        pygame.draw.circle(f, (230, 40, 50, 255), (m, 252), 15)
+        pygame.draw.circle(f, (255, 190, 190, 255), (m, 252), 6)
+        # shoulders
+        for sx in (-1, 1):
+            pygame.draw.polygon(f, (40, 36, 48, 255), [(m + sx * 100, 140), (m + sx * 170, 168), (m + sx * 150, 220), (m + sx * 96, 196)])
+            pygame.draw.polygon(f, edge, [(m + sx * 100, 140), (m + sx * 170, 168), (m + sx * 150, 220), (m + sx * 96, 196)], 2)
+        # head
+        pygame.draw.polygon(f, (36, 32, 44, 255), [(m - 44, 76 + sway), (m + 44, 76 + sway), (m + 52, 150), (m - 52, 150)])
+        pygame.draw.polygon(f, edge, [(m - 44, 76 + sway), (m + 44, 76 + sway), (m + 52, 150), (m - 52, 150)], 2)
+        ec = (int(255 * (0.3 + 0.7 * eyes)), int(30 + 20 * eyes), 40, 255)
+        pygame.draw.polygon(f, ec, [(m - 38, 104 + sway), (m - 8, 110 + sway), (m - 8, 120 + sway), (m - 36, 116 + sway)])
+        pygame.draw.polygon(f, ec, [(m + 38, 104 + sway), (m + 8, 110 + sway), (m + 8, 120 + sway), (m + 36, 116 + sway)])
+        for k in range(4):
+            pygame.draw.line(f, (90, 20, 26, 255), (m - 22 + k * 15, 134 + sway), (m - 22 + k * 15, 148 + sway), 3)
+        # the arms, and a chainsaw in each hand
+        for sx in (-1, 1):
+            ang = (0.45 + 0.08 * math.sin(t * 1.3 + sx)) * sx
+            ax, ay = m + sx * 150, 190
+            ex, ey = ax + math.sin(ang) * 120 + sx * 20, ay + math.cos(ang) * 130
+            pygame.draw.line(f, metal, (ax, ay), (ex, ey), 30)
+            pygame.draw.line(f, edge, (ax, ay), (ex, ey), 3)
+            # the saw: a long bar pointing down and outwards
+            bx, by_ = ex + sx * 36, ey + 96
+            pygame.draw.line(f, (70, 70, 84, 255), (ex, ey), (bx, by_), 22)
+            pygame.draw.line(f, (30, 30, 38, 255), (ex, ey), (bx, by_), 12)
+            ln = math.hypot(bx - ex, by_ - ey)
+            ux, uy = (bx - ex) / ln, (by_ - ey) / ln
+            for k in range(14):
+                u = ((k + t * 5.0) % 14) / 14.0
+                px, py = ex + ux * ln * u, ey + uy * ln * u
+                pygame.draw.circle(f, (230, 230, 240, 255), (int(px - uy * 11), int(py + ux * 11)), 2)
+                pygame.draw.circle(f, (230, 230, 240, 255), (int(px + uy * 11), int(py - ux * 11)), 2)
+            if int(t * 14) % 3 == 0:
+                for q in range(2):
+                    pygame.draw.line(f, (255, 200, 90, 255), (bx, by_), (bx + sx * (6 + q * 9), by_ + 8 + q * 7), 2)
+        f.set_alpha(int(255 * min(1.0, d)))
+        glow(s, cx, by - 330, 320, (255, 30, 40), 0.35 * d * (0.7 + 0.3 * eyes))
+        s.blit(f, (cx - m, by - H2 + 20 + 22))
+
+    def cs_shadow(self, s, cx, by, t):
+        sway = math.sin(t * 1.2) * 4
+        pts = [(cx - 28, by - 330 + sway), (cx + 28, by - 330 + sway), (cx + 78, by), (cx - 78, by)]
+        pygame.draw.polygon(s, (2, 2, 4), pts)
+        pygame.draw.circle(s, (2, 2, 4), (int(cx), int(by - 346 + sway)), 44)
+        pygame.draw.polygon(s, (2, 2, 4), [(cx - 44, by - 330 + sway), (cx, by - 430 + sway), (cx + 44, by - 330 + sway)])
+        for ex in (-14, 14):
+            glow(s, cx + ex, by - 350 + sway, 28, (255, 70, 80), 0.9)
+            pygame.draw.circle(s, (255, 190, 190), (int(cx + ex), int(by - 350 + sway)), 4)
+        for k in range(7):
+            u = (t * 0.35 + k / 7.0) % 1.0
+            xx = cx + math.sin(t + k * 2.1) * 60 * (0.5 + u)
+            pygame.draw.circle(s, (40, 6, 12), (int(xx), int(by - u * 360)), 3)
+
+    def screen_cutscene(self, s):
+        c = self.cs
+        dt = min(self.dt, 1 / 20.0)
+        c["t"] += dt
+        t = c["t"]
+        b = c["beats"][c["i"]]
+        tgt = dict(tubes=0.0, des=0.0, eyes=0.0, alarm=0.0, glitch=0.0, shake=0.0)
+        for bb in c["beats"][:c["i"] + 1]:
+            for k, v in bb["fx"].items():
+                tgt[k] = v
+        for k in tgt:
+            c["fx"][k] += (tgt[k] - c["fx"][k]) * min(1.0, dt * (6 if k in ("glitch", "shake", "alarm") else 2.2))
+        fx = c["fx"]
+        c["flash"] = max(0.0, c["flash"] - dt * 2.5)
+        rnd = random.Random(int(t * 24))
+        ox = rnd.uniform(-1, 1) * fx["shake"] * 7 if fx["shake"] > 0.02 else 0.0
+        oy = rnd.uniform(-1, 1) * fx["shake"] * 5 if fx["shake"] > 0.02 else 0.0
+        self.cs_scene(s, t, fx, ox, oy)
+        # red alarm light
+        if fx["alarm"] > 0.02:
+            a = int(70 * fx["alarm"] * (0.5 + 0.5 * math.sin(t * 7)))
+            ov = pygame.Surface((W, H), pygame.SRCALPHA)
+            ov.fill((255, 0, 20, a))
+            s.blit(ov, (0, 0))
+        # a picture that tears when he speaks
+        if fx["glitch"] > 0.05:
+            for _ in range(int(2 + 8 * fx["glitch"])):
+                y = rnd.randrange(0, H - 40)
+                hh = rnd.randrange(6, 40)
+                s.blit(s, (rnd.randint(-40, 40) * fx["glitch"], y), pygame.Rect(0, y, W, hh))
+            for _ in range(int(14 * fx["glitch"])):
+                pygame.draw.rect(s, (255, 40, 60) if rnd.random() < 0.5 else (240, 240, 255), (rnd.randrange(W), rnd.randrange(H), rnd.randrange(8, 90), 2))
+        # scanlines and a dark edge
+        ov = self.cs_vig()
+        s.blit(ov, (0, 0))
+        if c["flash"] > 0.01:
+            fl = pygame.Surface((W, H))
+            fl.fill((255, 255, 255))
+            fl.set_alpha(int(150 * c["flash"]))
+            s.blit(fl, (0, 0))
+        # the title card
+        if c["i"] == 0 and not c["beats"][0].get("choice") and c["t"] < 3.0 and len(c["beats"]) > 1:
+            u = clamp(1.0 - abs(c["t"] - 1.5) / 1.5, 0, 1)
+            draw_glow_text(s, "THE BLOOD FACTORY", 90, scale_col((255, 40, 60), u), W // 2, 200)
+        # ---- the words
+        out = c["out"]
+        if out is None:
+            who, txt = b["who"], b["text"]
+        else:
+            who = "SHADOW"
+            txt = c["lines"][min(c["li"], len(c["lines"]) - 1)]
+        wcol = (255, 60, 70) if who == "DESOLATION" else (210, 200, 255)
+        c["typed"] = min(float(len(txt)), c["typed"] + dt * (46 if who != "DESOLATION" else 60))
+        shown = txt[:int(c["typed"])]
+        c["blip"] -= dt
+        if c["typed"] < len(txt) and c["blip"] <= 0:
+            c["blip"] = 0.07
+            self.audio.play("talk", 0.35)
+        R = pygame.Rect(110, 520, W - 220, 150)
+        panel(s, R, (6, 4, 10), 232, wcol if who == "DESOLATION" else (90, 80, 140), 14, 2)
+        jx = rnd.randint(-2, 2) if who == "DESOLATION" else 0
+        draw_text(s, who, 26, wcol, R.x + 24 + jx, R.y + 28, "l")
+        for j, ln in enumerate(wrap(shown, 28, R.w - 60)[:4]):
+            draw_text(s, ln, 28, WHITE if who != "DESOLATION" else (255, 170, 175), R.x + 24 + jx, R.y + 64 + j * 30, "l")
+        done = c["typed"] >= len(txt)
+        if out is None:
+            if b.get("choice") and done:
+                Y = pygame.Rect(W // 2 - 330, 440, 310, 60)
+                N = pygame.Rect(W // 2 + 20, 440, 310, 60)
+                if self.button("cs_yes", Y, "YES, I'LL HELP", (90, 235, 140), 26, True, "(your match here will end)"):
+                    self.cs_decide(True)
+                if self.button("cs_no", N, "NO, NOT NOW", (255, 120, 120), 26, True):
+                    self.cs_decide(False)
+            elif done:
+                draw_text(s, "click, SPACE or ENTER", 15, (150, 140, 170) if int(t * 2) % 2 else DIM, R.right - 20, R.bottom - 18, "r")
+        else:
+            if done:
+                draw_text(s, "click, SPACE or ENTER", 15, (150, 140, 170) if int(t * 2) % 2 else DIM, R.right - 20, R.bottom - 18, "r")
+        adv = self.click or pygame.K_SPACE in self.pressed or pygame.K_RETURN in self.pressed
+        if adv and not self.lock and c["out_t"] <= 0:
+            self.click = False
+            if out is None:
+                if not (b.get("choice") and done):
+                    self.cs_next()
+            elif not done:
+                c["typed"] = float(len(txt))
+            else:
+                c["li"] += 1
+                c["typed"] = 0.0
+                if c["li"] >= len(c["lines"]):
+                    c["out_t"] = 0.001
+        if pygame.K_ESCAPE in self.pressed and out is None:
+            c["i"] = len(c["beats"]) - 1
+            c["typed"] = 0.0
+        if c["out_t"] > 0:
+            c["out_t"] += dt
+            u = clamp(c["out_t"] / 1.2, 0, 1)
+            fl = pygame.Surface((W, H))
+            fl.fill((255, 255, 255) if out == "yes" else (0, 0, 0))
+            fl.set_alpha(int(255 * u))
+            s.blit(fl, (0, 0))
+            if u >= 1.0:
+                self.cs = None
+                if out == "yes":
+                    self.bf_go_obby()
+                else:
+                    self.goto("play" if self.world is not None else "events")
+
+    def cs_vig(self):
+        v = getattr(self, "_cs_vig", None)
+        if v is None:
+            v = pygame.Surface((W, H), pygame.SRCALPHA)
+            for i in range(0, 12):
+                a = int(14 * (12 - i))
+                pygame.draw.rect(v, (0, 0, 0, a), (i * 14, i * 8, W - i * 28, H - i * 16), 14)
+            for y in range(0, H, 3):
+                pygame.draw.line(v, (0, 0, 0, 40), (0, y), (W, y))
+            self._cs_vig = v
+        return v
+
+    def bf_enter(self):
+        """EVENTS > PLAY: into the facility, through the parkour first"""
+        self.bf_go_obby()
+
+
+    # ------------------------------------------------------------ the Blood Factory parkour: sneak in, climb up, reach the room (3D, with your own orb)
+    def bf_go_obby(self, mp=None):
+        self.world = None
+        self.cs = None
+        self.obby_new(mp)
+        self.goto("obby")
+
+    def obby_new(self, mp=None):
+        C = ob_course()
+        slot = int(mp["me"]) if mp else 0
+        off = (slot - 1.5) * 20.0 if mp else 0.0
+        o = ob_new(C, 0.0, off)
+        o.update(C=C, cps=C["cps"], says=C["says"], said=set(), q=[], cur=None, cur_t=0.0, typed=0.0, cp=0, pop=0.0, deaths=0, run_deaths=0, flash=0.0,
+                 intro=True, done=0.0, pause=False, fall_said=0, sparks=[], t=0.0, yaw=0.0, pitch=0.46, dist=190.0, manual=0.0, spawned=0.0, best_s=0.0,
+                 cx=o["x"], cy=o["y"], cz=o["z"], mp=mp, slot=slot, off=off, finished=False, trail=[], door=0.0, sent=0.0, start_t=0.0, wait_t=0.0)
+        self.ob = o
+        self.ob_prev = {}
+
+    def ob_say(self, who, text, rage=0):
+        self.ob["q"].append((who, text, rage))
+
+    def ob_die(self, why):
+        o = self.ob
+        if o["dead"] > 0:
+            return
+        o["dead"] = 0.9
+        o["why"] = why
+        o["deaths"] += 1
+        o["run_deaths"] += 1
+        o["flash"] = 1.0
+        self.audio.play("crash", 0.5)
+        col = tuple(self.pcol())
+        for i in range(18):
+            a = random.uniform(0, TAU)
+            sp = random.uniform(40, 200)
+            o["sparks"].append([o["x"], o["y"], o["z"] + 12, math.cos(a) * sp, math.sin(a) * sp, random.uniform(80, 260), random.uniform(0.4, 0.9), col if i % 2 else (255, 90, 80)])
+        sv = self.save["bf"]
+        sv["falls"] = sv.get("falls", 0) + 1
+        n = o["deaths"]
+        if n in (3, 8, 14, 22) and o["fall_said"] < n:
+            o["fall_said"] = n
+            self.ob_say("SHADOW", {3: "Deep breaths. Try again.", 8: "You're closer than you think.", 14: "It's okay. Hard things are hard. You can skip it if you want.",
+                                   22: "Whenever you're ready. I'm not going anywhere."}[n], 0)
+
+    def ob_respawn(self):
+        o = self.ob
+        c = o["cps"][o["cp"]]
+        o["x"], o["y"], o["z"] = c[0] + o["off"], c[1] + o["off"], c[2]
+        o["vx"] = o["vy"] = o["vz"] = 0.0
+        o["on"] = None
+        o["prev"] = {}
+        o["spawned"] = 0.6
+        o["manual"] = 0.0
+        o["yaw"] = ob_proj(o["C"], c[0], c[1], c[2])[1]
+        o["cx"], o["cy"], o["cz"] = o["x"], o["y"], o["z"]
+
+    def ob_step(self, dt, first):
+        """one tiny step of the parkour physics, steered from where the camera looks"""
+        o = self.ob
+        f = int(self.kh("up")) - int(self.kh("down"))
+        sd = int(self.kh("right")) - int(self.kh("left"))
+        cy, sy = math.cos(o["yaw"]), math.sin(o["yaw"])
+        ix, iy = cy * f - sy * sd, sy * f + cy * sd
+        o["T"] += dt
+        ob_tick(o, dt)
+        ob_phys(o, dt, ix, iy, first and self.kp("jump"), self.kh("jump"), self.kh("sprint"))
+        col = tuple(self.pcol())
+        for ev in o["ev"]:
+            k = ev[0]
+            if k == "jump":
+                self.audio.play("jump", 0.4)
+                for i in range(4):
+                    o["sparks"].append([o["x"], o["y"], o["z"] + 2, random.uniform(-50, 50), random.uniform(-50, 50), random.uniform(20, 70), 0.3, mix_col(col, WHITE, 0.5)])
+            elif k == "land":
+                self.audio.play("land", 0.4)
+                for i in range(6):
+                    o["sparks"].append([ev[1], ev[2], ev[3] + 2, random.uniform(-70, 70), random.uniform(-70, 70), random.uniform(30, 90), 0.35, mix_col(col, WHITE, 0.4)])
+            elif k == "die":
+                self.ob_die(ev[1])
+        o["ev"] = []
+        if o["on"] is not None and self.kh("sprint") and math.hypot(o["vx"], o["vy"]) > 170 and random.random() < 0.5:
+            o["sparks"].append([o["x"], o["y"], o["z"] + 3, random.uniform(-12, 12), random.uniform(-12, 12), random.uniform(10, 40), 0.3, mix_col(col, WHITE, 0.35)])
+
+    def ob_camera(self, dt):
+        """the camera sits behind your orb.  Drag with the right mouse button (or Q / E) to look around; left alone it turns to face where the course goes."""
+        o = self.ob
+        sens = self.save["settings"]["sens"]
+        rx, ry = self.mrel
+        moved = False
+        if self.rdown:
+            o["yaw"] += rx * 0.006 * sens
+            o["pitch"] = clamp(o["pitch"] + ry * 0.005 * sens, 0.18, 1.25)
+            moved = bool(rx or ry)
+        if self.kh("cam_left"):
+            o["yaw"] -= 1.7 * dt
+            moved = True
+        if self.kh("cam_right"):
+            o["yaw"] += 1.7 * dt
+            moved = True
+        if self.kh("cam_up"):
+            o["pitch"] = clamp(o["pitch"] + 0.9 * dt, 0.18, 1.25)
+            moved = True
+        if self.kh("cam_down"):
+            o["pitch"] = clamp(o["pitch"] - 0.9 * dt, 0.18, 1.25)
+            moved = True
+        zoom = self.wheel
+        if self.kh("zoom_in"):
+            zoom += dt * 6
+        if self.kh("zoom_out"):
+            zoom -= dt * 6
+        if zoom:
+            o["dist"] = clamp(o["dist"] * (0.9 ** zoom), 90.0, 380.0)
+        if moved:
+            o["manual"] = 2.6
+        else:
+            o["manual"] = max(0.0, o["manual"] - dt)
+            if o["manual"] <= 0.0 and o["dead"] <= 0.0:
+                s, ang = ob_proj(o["C"], o["x"], o["y"], o["z"])
+                d = (ang - o["yaw"] + math.pi) % TAU - math.pi
+                o["yaw"] += clamp(d, -1.0, 1.0) * min(1.0, dt * 1.8)
+        k = min(1.0, dt * 9.0)
+        o["cx"] += (o["x"] - o["cx"]) * k
+        o["cy"] += (o["y"] - o["cy"]) * k
+        o["cz"] += (o["z"] - o["cz"]) * min(1.0, dt * 4.0)
+
+    def ob_can_skip(self):
+        bf = self.save["bf"]
+        return bool(bf.get("obby_done") or bf.get("falls", 0) >= 12)
+
+    def screen_obby(self, s):
+        o = self.ob
+        if o is None:
+            self.goto("events")
+            return
+        dt = min(self.dt, 1 / 20.0)
+        sv = self.save
+        bf = sv["bf"]
+        t = self.time
+        mp = o["mp"]
+        if o["intro"]:
+            self.ob_camera(0.0)
+            o["yaw"] += dt * 0.25
+            self.ob_draw(s, t)
+            self.dim(s, 175)
+            R = pygame.Rect(0, 0, 780, 500)
+            R.center = (W // 2, H // 2)
+            panel(s, R, (14, 6, 12), 245, (255, 60, 70), 18, 3)
+            draw_glow_text(s, "SNEAK IN", 78, (255, 70, 80), R.centerx, R.y + 60)
+            draw_text(s, "Climb through the Blood Factory to the room where Desolation builds his army.", 20, WHITE, R.centerx, R.y + 116)
+            y = R.y + 158
+            for ln in ("%s %s %s %s   move your orb (the way the camera looks)" % (self.kname("up"), self.kname("left"), self.kname("down"), self.kname("right")),
+                       "%s   jump  (hold it for a higher one)" % self.kname("jump"),
+                       "%s   sprint (hold) - you need it for the long gaps" % self.kname("sprint"),
+                       "Right mouse button, or %s / %s   turn the camera.   Mouse wheel   zoom" % (self.kname("cam_left"), self.kname("cam_right")),
+                       "Nothing stops you falling. If you do, you wake up at the last green flag."):
+                draw_text(s, ln, 19, GREY if ln.startswith("Nothing") else WHITE, R.centerx, y)
+                y += 29
+            if mp:
+                draw_text(s, "Everybody runs at the same time.  The fight starts when all of you are through the door.", 18, GOLD, R.centerx, y + 8)
+            if self.button("ob_go", pygame.Rect(R.centerx - 320, R.bottom - 130, 300, 56), "LET'S GO", (90, 235, 140), 28):
+                o["intro"] = False
+                bf["met"] = True
+                self.store()
+                self.ob_say("SHADOW", "Stay low. Hold SHIFT to sprint, SPACE to jump. And don't look down.", 0)
+            can_skip = self.ob_can_skip()
+            lab = "SKIP TO THE ROOM" if can_skip else "SKIP (after 12 falls)"
+            if self.button("ob_skip", pygame.Rect(R.centerx + 20, R.bottom - 130, 300, 56), lab, GOLD if can_skip else GREY, 22, can_skip):
+                self.ob_finish(skip=True)
+                return
+            if self.button("ob_back", pygame.Rect(R.centerx - 100, R.bottom - 62, 200, 44), "BACK", CYAN, 22) or pygame.K_ESCAPE in self.pressed:
+                self.ob_leave()
+                return
+            return
+        if pygame.K_ESCAPE in self.pressed or self.kp("pause"):
+            o["pause"] = not o["pause"]
+        frozen = o["pause"] and not mp
+        if not frozen:
+            o["t"] += dt
+            n = max(1, int(math.ceil(dt / (1 / 120.0))))
+            h = dt / n
+            self.ob_camera(dt)
+            if o["finished"]:
+                o["T"] += dt
+                ob_tick(o, dt)
+                o["wait_t"] += dt
+            elif o["dead"] > 0:
+                o["dead"] -= dt
+                o["T"] += dt
+                ob_tick(o, dt)
+                if o["dead"] <= 0:
+                    self.ob_respawn()
+            elif o["done"] > 0:
+                o["done"] += dt
+                o["T"] += dt
+                ob_tick(o, dt)
+                o["door"] = min(1.0, o["door"] + dt * 0.8)
+                o["C"]["door"]["open"] = o["door"]
+                ex, ey, ez = o["C"]["end"]
+                dx, dy = ex - o["x"], ey - o["y"]
+                dn = math.hypot(dx, dy) or 1.0
+                o["x"] += dx / dn * OB_RUN * 0.5 * dt
+                o["y"] += dy / dn * OB_RUN * 0.5 * dt
+                if o["done"] > 1.9:
+                    self.ob_finish()
+                    if self.ob is None:
+                        return
+            else:
+                for i in range(n):
+                    self.ob_step(h, i == 0)
+                    if o["dead"] > 0:
+                        break
+                o["spawned"] = max(0.0, o["spawned"] - dt)
+                s_, ang = ob_proj(o["C"], o["x"], o["y"], o["z"])
+                if o["dead"] <= 0:
+                    o["best_s"] = max(o["best_s"], s_)
+                for i, c in enumerate(o["cps"]):
+                    if i > o["cp"] and math.hypot(o["x"] - c[0], o["y"] - c[1]) < 70 and abs(o["z"] - c[2]) < 40 and o["dead"] <= 0:
+                        o["cp"] = i
+                        o["run_deaths"] = 0
+                        self.audio.play("secret", 0.5)
+                        o["pop"] = 1.4
+                        for kk in range(18):
+                            a = random.uniform(0, TAU)
+                            o["sparks"].append([c[0], c[1], c[2] + 6, math.cos(a) * 90, math.sin(a) * 90, random.uniform(80, 200), 0.8, (120, 255, 150)])
+                        sy = o["C"]["cpsay"].get(i)
+                        if sy:
+                            self.ob_say(*sy)
+                for j, sy in enumerate(o["says"]):
+                    if j not in o["said"] and math.hypot(o["x"] - sy[0], o["y"] - sy[1]) < sy[2] and abs(o["z"] - o["cps"][o["cp"]][2]) < 200:
+                        o["said"].add(j)
+                        self.ob_say(sy[3], sy[4], sy[5])
+                ex, ey, ez = o["C"]["end"]
+                if math.hypot(o["x"] - ex, o["y"] - ey) < 36 and o["on"] is not None and o["dead"] <= 0:
+                    o["done"] = 0.001
+                    self.audio.play("levelup", 0.6)
+                    self.ob_say("DESOLATION", "FINE. COME IN. COME INTO MY FACTORY. I WILL SHOW YOU WHAT I BUILD.", 4)
+            for sp in o["sparks"]:
+                sp[0] += sp[3] * dt
+                sp[1] += sp[4] * dt
+                sp[2] += sp[5] * dt
+                sp[5] -= 700 * dt
+                sp[6] -= dt
+            o["sparks"] = [q for q in o["sparks"] if q[6] > 0]
+            o["flash"] = max(0.0, o["flash"] - dt * 2.2)
+            o["land"] = max(0.0, o["land"] - dt)
+        self.ob_draw(s, t)
+        # ---- the words
+        if o["cur"] is None and o["q"]:
+            o["cur"] = o["q"].pop(0)
+            o["cur_t"] = 0.0
+            o["typed"] = 0.0
+            if o["cur"][0] == "DESOLATION":
+                self.audio.play("emp", 0.4)
+        if o["cur"] is not None and not frozen:
+            who, txt, rg = o["cur"]
+            o["cur_t"] += dt
+            o["typed"] = min(len(txt), o["typed"] + dt * (38 + rg * 8))
+            R = pygame.Rect(W // 2 - 400, H - 118, 800, 92)
+            hot = (255, 60, 72) if who == "DESOLATION" else (210, 200, 255)
+            panel(s, R, mix_col((8, 6, 14), (46, 4, 8), rg / 4.0) if who == "DESOLATION" else (8, 6, 14), 232, hot, 12, 2)
+            jit = rg * 0.5 if (who == "DESOLATION" and rg >= 3) else 0.0
+            draw_text(s, who, 18, hot, R.x + 20 + random.uniform(-jit, jit), R.y + 20, "l")
+            for j, ln in enumerate(wrap(txt[:int(o["typed"])], 22 + (rg >= 3), R.w - 40)[:2]):
+                draw_text(s, ln, 22 + (rg >= 3), WHITE if who != "DESOLATION" or rg < 3 else (255, 190, 190), R.x + 20 + random.uniform(-jit, jit), R.y + 50 + j * 26, "l")
+            if o["cur_t"] > 2.2 + len(txt) / 30.0:
+                o["cur"] = None
+        # ---- the top bits
+        hr = pygame.Rect(0, 0, W, 44)
+        panel(s, hr, (8, 6, 14), 190, (120, 30, 40), 0, 0)
+        draw_text(s, "THE BLOOD FACTORY", 20, (255, 90, 100), 18, 22, "l")
+        total = float(o["C"]["total"])
+        pr = clamp(o["best_s"] / total, 0.0, 1.0)
+        bar = pygame.Rect(W // 2 - 220, 15, 440, 14)
+        pygame.draw.rect(s, (30, 12, 18), bar, border_radius=6)
+        pygame.draw.rect(s, (255, 70, 80), (bar.x, bar.y, int(bar.w * pr), bar.h), border_radius=6)
+        pygame.draw.rect(s, LINE, bar, 2, border_radius=6)
+        for c in o["cps"][1:]:
+            xx = bar.x + bar.w * ob_proj(o["C"], c[0], c[1], c[2])[0] / total
+            pygame.draw.line(s, (120, 255, 150), (xx, bar.y - 3), (xx, bar.bottom + 3), 2)
+        draw_text(s, "FALLS  %d" % o["deaths"], 18, GOLD if o["deaths"] else GREY, W - 18, 22, "r")
+        if mp:
+            self.ob_mates(s, o, mp)
+        if o["pop"] > 0:
+            o["pop"] -= dt
+            draw_glow_text(s, "CHECKPOINT", 50, (120, 255, 150), W // 2, 120)
+        if o["flash"] > 0.02:
+            fl = pygame.Surface((W, H), pygame.SRCALPHA)
+            fl.fill((255, 20, 30, int(150 * o["flash"])))
+            s.blit(fl, (0, 0))
+        if o["dead"] > 0:
+            draw_glow_text(s, {"fall": "SPLASH!", "crush": "SQUISHED!", "zap": "ZAPPED!"}.get(o["why"], "OOPS!"), 70, (255, 90, 90), W // 2, H // 2 - 30)
+        if o["spawned"] > 0:
+            a = int(255 * o["spawned"] / 0.6)
+            fl = pygame.Surface((W, H), pygame.SRCALPHA)
+            fl.fill((0, 0, 0, a))
+            s.blit(fl, (0, 0))
+        if o["done"] > 0 and not o["finished"]:
+            u = clamp((o["done"] - 1.2) / 0.7, 0, 1)
+            fl = pygame.Surface((W, H))
+            fl.fill((255, 255, 255))
+            fl.set_alpha(int(255 * u))
+            s.blit(fl, (0, 0))
+        if o["finished"] and mp:
+            self.ob_waiting(s, o, mp)
+        if o["pause"]:
+            self.dim(s, 190)
+            R = pygame.Rect(0, 0, 420, 330)
+            R.center = (W // 2, H // 2)
+            panel(s, R, PANEL, 245, CYAN, 18, 3)
+            draw_glow_text(s, "PAUSED", 56, CYAN, R.centerx, R.y + 50)
+            if self.button("ob_res", pygame.Rect(R.x + 40, R.y + 100, R.w - 80, 54), "RESUME", GREEN, 26):
+                o["pause"] = False
+            can_skip = self.ob_can_skip()
+            if self.button("ob_sk2", pygame.Rect(R.x + 40, R.y + 166, R.w - 80, 54), "SKIP TO THE ROOM" if can_skip else "SKIP (after 12 falls)", GOLD if can_skip else GREY, 22, can_skip and not o["finished"]):
+                self.ob_finish(skip=True)
+                return
+            if self.button("ob_out", pygame.Rect(R.x + 40, R.y + 232, R.w - 80, 54), "LEAVE", RED, 26):
+                self.ob_leave()
+
+    def ob_leave(self):
+        """out of the factory (the others carry on without you)"""
+        self.ob = None
+        mp = self.obmp is not None
+        if mp:
+            self.obmp_leave()
+        self.goto("menu" if mp else "events")
+
+    def ob_mates(self, s, o, mp):
+        """the other runners: a little race track in the corner"""
+        pl = self.obmp["pl"] if self.obmp else {}
+        total = float(o["C"]["total"])
+        y = 56
+        for pid in sorted(pl):
+            p = pl[pid]
+            col = tuple(p.get("col", WHITE))[:3]
+            r = pygame.Rect(W - 250, y, 232, 22)
+            panel(s, r, (8, 6, 14), 170, scale_col(col, 0.6), 6, 1)
+            self.draw_orb(s, r.x + 12, r.centery, 6, col)
+            draw_text(s, str(p.get("name", "?"))[:10], 13, WHITE, r.x + 24, r.centery, "l")
+            bx = pygame.Rect(r.x + 100, r.centery - 4, 100, 8)
+            pygame.draw.rect(s, (30, 12, 18), bx, border_radius=4)
+            pygame.draw.rect(s, col, (bx.x, bx.y, int(bx.w * clamp(p.get("s", 0.0) / total, 0.0, 1.0)), bx.h), border_radius=4)
+            if p.get("done"):
+                draw_text(s, "IN", 14, GREEN, r.right - 10, r.centery, "r")
+            y += 26
+
+    def ob_waiting(self, s, o, mp):
+        """through the door: waiting for the rest of the team (the host can go on without them)"""
+        pl = self.obmp["pl"] if self.obmp else {}
+        R = pygame.Rect(0, 0, 560, 250)
+        R.center = (W // 2, H // 2 - 40)
+        panel(s, R, (14, 6, 12), 235, (255, 60, 70), 16, 3)
+        draw_glow_text(s, "YOU MADE IT", 54, (255, 90, 100), R.centerx, R.y + 44)
+        n_in = sum(1 for p in pl.values() if p.get("done"))
+        draw_text(s, "Waiting for your friends   %d / %d" % (n_in, max(1, len(pl))), 22, WHITE, R.centerx, R.y + 92)
+        y = R.y + 122
+        for pid in sorted(pl):
+            p = pl[pid]
+            col = tuple(p.get("col", WHITE))[:3]
+            self.draw_orb(s, R.x + 150, y, 6, col)
+            draw_text(s, str(p.get("name", "?"))[:14], 17, WHITE, R.x + 170, y, "l")
+            draw_text(s, "IN" if p.get("done") else "climbing...", 16, GREEN if p.get("done") else GREY, R.right - 150, y, "r")
+            y += 24
+        host = bool(self.obmp and self.obmp["host"])
+        if host:
+            if self.button("ob_now", pygame.Rect(R.centerx - 150, R.bottom - 50, 300, 40), "START NOW", GOLD, 22):
+                self.obmp_launch()
+        else:
+            draw_text(s, "The host starts the fight.", 16, DIM, R.centerx, R.bottom - 30)
+
+    def ob_finish(self, skip=False):
+        sv = self.save
+        sv["bf"]["obby_done"] = True
+        self.store()
+        o = self.ob
+        mp = o["mp"] if o is not None else None
+        if mp and self.obmp is not None:
+            if not o["finished"]:
+                o["finished"] = True
+                o["x"], o["y"], o["z"] = o["C"]["end"][0], o["C"]["end"][1], o["C"]["end"][2]
+                self.obmp_done()
+            return
+        self.ob = None
+        self.start_game("blood", "event")
+
+    # ---- drawing the course
+    def ob_f(self, c):
+        """a colour seen through the red haze of the factory (the further away, the more of it)"""
+        k = self.ob_fk
+        return c if k <= 0.01 else mix_col(c, (44, 8, 16), k)
+
+    def ob_cuboid(self, r, cam, x0, x1, y0, y1, z0, z1, top, front, side, edge=True):
+        """a box, whatever side you look at it from"""
+        cx, cy, cz = cam.x, cam.y, cam.z
+        f_ = self.ob_f
+        top, front, side = f_(top), f_(front), f_(side)
+        poly = r.poly
+        if cx < x0:
+            poly([(x0, y0, z0), (x0, y1, z0), (x0, y1, z1), (x0, y0, z1)], side)
+        elif cx > x1:
+            poly([(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)], scale_col(side, 0.85))
+        if cy < y0:
+            poly([(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)], scale_col(front, 0.92))
+        elif cy > y1:
+            poly([(x0, y1, z0), (x1, y1, z0), (x1, y1, z1), (x0, y1, z1)], front)
+        if cz > z1:
+            poly([(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)], top)
+            if edge:
+                r.lines([(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)], scale_col(top, 1.22), 1, True)
+            if self.ob_fk < 0.35 and (x1 - x0 > 60 or y1 - y0 > 60) and z1 - z0 > 20:
+                # a steel grating, and a yellow-and-black warning edge
+                gc = scale_col(top, 0.8)
+                xx = x0 + 20
+                while xx < x1 - 4:
+                    r.line((xx, y0, z1 + 0.15), (xx, y1, z1 + 0.15), gc, 1)
+                    xx += 20
+                yy = y0 + 20
+                while yy < y1 - 4:
+                    r.line((x0, yy, z1 + 0.15), (x1, yy, z1 + 0.15), gc, 1)
+                    yy += 20
+                for ex0, ey0, ex1, ey1 in ((x0, y0, x1, y0), (x0, y1, x1, y1), (x0, y0, x0, y1), (x1, y0, x1, y1)):
+                    n = max(2, int(math.hypot(ex1 - ex0, ey1 - ey0) / 12))
+                    for i in range(0, n, 2):
+                        u0, u1 = i / float(n), min(1.0, (i + 1) / float(n))
+                        r.line((ex0 + (ex1 - ex0) * u0, ey0 + (ey1 - ey0) * u0, z1 + 0.3), (ex0 + (ex1 - ex0) * u1, ey0 + (ey1 - ey0) * u1, z1 + 0.3), (240, 200, 40), 2)
+        elif cz < z0:
+            poly([(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)], scale_col(side, 0.6))
+
+    def ob_box(self, r, cam, q, T, t):
+        b, x0, x1, y0, y1, z0, z1 = q
+        k = b["k"]
+        top, front, side = b["col"]
+        if k == "c":
+            sh = 0.0
+            if b["st"] == 1:
+                sh = math.sin(T * 60) * 1.2
+            elif b["st"] == 2:
+                sh = -b["tm"] * b["tm"] * 400
+            z0 += sh
+            z1 += sh
+            top, front, side = mix_col((150, 90, 50), (255, 150, 60), 0.5 if b["st"] == 1 else 0.0), (110, 64, 40), (84, 48, 32)
+        elif k == "p":
+            top, front, side = (220, 70, 70), (170, 40, 46), (120, 28, 34)
+        elif k == "m":
+            top, front, side = (230, 200, 70), (170, 140, 40), (120, 98, 30)
+        elif k == "d":
+            if b.get("open") is not None:
+                top, front, side = (255, 70, 80), (190, 36, 48), (140, 26, 36)
+        self.ob_cuboid(r, cam, x0, x1, y0, y1, z0, z1, top, front, side)
+        xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+        if k == "b":
+            dxn, dyn = b["bv"]
+            sp = math.hypot(dxn, dyn)
+            ux, uy = (dxn / sp, dyn / sp) if sp else (1.0, 0.0)
+            ln = abs(x1 - x0) if abs(ux) > 0.5 else abs(y1 - y0)
+            wd = abs(y1 - y0) if abs(ux) > 0.5 else abs(x1 - x0)
+            n = int(ln / 22)
+            for i in range(n):
+                u = ((i * 22 + sp * T) % (ln - 12)) - (ln - 12) / 2.0
+                px, py = xm + ux * u, ym + uy * u
+                zz = z1 + 0.5
+                a1 = (px - ux * 5 - uy * 9, py - uy * 5 + ux * 9, zz)
+                a2 = (px + ux * 4, py + uy * 4, zz)
+                a3 = (px - ux * 5 + uy * 9, py - uy * 5 - ux * 9, zz)
+                r.lines([a1, a2, a3], (255, 190, 80), 2)
+        elif k == "p":
+            for i in range(int(abs(x1 - x0) / 14)):
+                xx = x0 + 4 + i * 14
+                r.line((xx, y0 - 0.2, z0 + 2), (xx + 8, y0 - 0.2, z1 - 2), (255, 220, 120), 2)
+            r.line((xm, ym, z1), (xm, ym, z1 + 320), (120, 120, 140), 6)
+        elif k == "s" and b.get("trim"):
+            r.lines([(x0, y0, z1 - 1.5), (x1, y0, z1 - 1.5), (x1, y1, z1 - 1.5), (x0, y1, z1 - 1.5)], (255, 60, 70), 2, True)
+
+    def ob_hazard(self, r, cam, h, T, t):
+        k = h["k"]
+        if k == "sweep":
+            cx, cy, zc = h["cx"], h["cy"], h["z"]
+            a = h["ph"] + T * h["w"]
+            L = h["len"]
+            p1 = (cx + math.cos(a) * L, cy + math.sin(a) * L, zc)
+            p2 = (cx - math.cos(a) * L, cy - math.sin(a) * L, zc)
+            r.line((cx, cy, zc - 40), (cx, cy, zc), (80, 80, 96), 6)
+            r.line(p1, p2, (255, 70, 70), 8)
+            r.line((p1[0], p1[1], zc + 4), (p2[0], p2[1], zc + 4), (255, 200, 200), 2)
+            r.dot(cx, cy, zc, 7, (120, 120, 140))
+            for p in (p1, p2):
+                r.dot(p[0], p[1], p[2], 5, (255, 220, 120), 0.5)
+        else:
+            on, warn = ob_laser(h, T)
+            x0, x1, y0, y1, z0, z1 = h["x0"], h["x1"], h["y0"], h["y1"], h["z0"], h["z1"]
+            xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+            for px, py in ((x0, y0), (x1, y1)):
+                r.line((px, py, z0 - 2), (px, py, z1 + 6), (90, 90, 110), 5)
+                r.dot(px, py, z1 + 6, 4, (255, 100, 100) if on else (110, 60, 60))
+            if on:
+                r.poly([(x0, y0, z0), (x1, y1, z0), (x1, y1, z1), (x0, y0, z1)], (255, 60, 70))
+                r.line((x0, y0, (z0 + z1) / 2), (x1, y1, (z0 + z1) / 2), (255, 230, 230), 2)
+                r.glow(xm, ym, (z0 + z1) / 2, 70, (255, 40, 50), 0.6)
+            elif warn:
+                r.line((x0, y0, (z0 + z1) / 2), (x1, y1, (z0 + z1) / 2), (255, 90, 90), 1)
+
+    def ob_flag(self, r, c, t, got):
+        x, y, z = c
+        col = (120, 255, 150) if got else (130, 130, 150)
+        r.line((x, y, z), (x, y, z + 46), (170, 170, 190), 3)
+        w = math.sin(t * 5) * 3
+        r.poly([(x, y, z + 46), (x + 22 + w, y + 4, z + 40), (x, y, z + 32)], col)
+        r.poly([(x, y, z + 46), (x, y + 22 + w, z + 40), (x, y, z + 32)], col)
+        r.ring(x, y, z + 0.8, 18, col, 2, 16)
+        if got:
+            r.glow(x, y, z + 20, 40, col, 0.5)
+
+    def ob_orb(self, r, cam, x, y, z, col, name, title, t, me, gz, ph):
+        """a player's orb, the same ball you see in a match"""
+        s = r.s
+        zc = z + 12 + math.sin(t * 2.4 + ph) * 1.5
+        q = cam.pt(x, y, zc)
+        if q is None:
+            return
+        k = q[2]
+        if gz is not None:
+            dz = max(0.0, z - gz)
+            r.ring(x, y, gz + 0.6, max(3.0, 8.5 - dz * 0.04), (10, 4, 8), 2, 12, fill=(10, 4, 8))
+            if dz > 14:
+                r.line((x, y, gz + 0.8), (x, y, z + 2), (255, 255, 255), 1)
+        glow(s, q[0], q[1], 30 * k, col, 0.7)
+        rr = max(3.0, 8.5 * k)
+        pygame.draw.circle(s, scale_col(col, 0.75), (q[0], q[1]), rr)
+        pygame.draw.circle(s, mix_col(col, WHITE, 0.55), (q[0] - rr * 0.25, q[1] - rr * 0.3), rr * 0.55)
+        pygame.draw.circle(s, WHITE, (q[0], q[1]), rr, 1)
+        r.ring(x, y, z + 1.0, 13, col, 1, 12)
+        if me:
+            self.labels.append((3, q[0], q[1], rr, scale_col(col, 0.8)))
+        else:
+            yy = q[1] - min(rr, 60) - 14
+            if title:
+                self.labels.append((0, title, 13, GOLD, q[0], yy))
+                yy -= 15
+            self.labels.append((0, name, 18, WHITE, q[0], yy))
+
+    def ob_ground(self, sol, x, y, z):
+        gz = None
+        for q in sol:
+            if q[0]["k"] == "d":
+                continue
+            if x + 3 > q[1] and x - 3 < q[2] and y + 3 > q[3] and y - 3 < q[4] and q[6] <= z + 2.0:
+                if gz is None or q[6] > gz:
+                    gz = q[6]
+        return gz
+
+    def ob_draw(self, s, t):
+        o = self.ob
+        T = o["T"]
+        C = o["C"]
+        # ---- the dark inside of the factory
+        for y in range(0, H, 6):
+            u = y / float(H)
+            pygame.draw.rect(s, mix_col((16, 3, 8), (74, 12, 18), u ** 1.5), (0, y, W, 6))
+        cam = self.obcam
+        cam.F = 900.0
+        cam.look(o["cx"], o["cy"], o["cz"] + 14, o["dist"], o["yaw"], o["pitch"])
+        r = self.obr
+        r.begin(s, cam)
+        # the sea of red far below
+        zf = -150.0
+        g0x, g0y = math.floor(o["cx"] / 240.0) * 240.0, math.floor(o["cy"] / 240.0) * 240.0
+        for gx in range(-6, 7):
+            for gy in range(-6, 7):
+                xx, yy = g0x + gx * 240.0, g0y + gy * 240.0
+                r.poly([(xx, yy, zf), (xx + 240, yy, zf), (xx + 240, yy + 240, zf), (xx, yy + 240, zf)],
+                       mix_col((96, 10, 20), (150, 22, 34), 0.5 + 0.5 * math.sin(gx * 1.3 + gy * 0.9 + g0x * 0.01 + t * 1.2)))
+        for kk in range(36):
+            bx = g0x - 600 + (kk * 97 + T * 13) % 1300
+            by = g0y - 600 + (kk * 53 + T * 7) % 1300
+            r.dot(bx, by, zf + 1 + math.sin(T * 2 + kk) * 2, 3 + kk % 3, (255, 120, 130))
+        # ---- everything solid, far to near
+        sol = ob_solids(o["B"], T, 1)
+        items = []
+        dist = cam.depth
+        for q in sol:
+            xm, ym, zm = (q[1] + q[2]) / 2, (q[3] + q[4]) / 2, (q[5] + q[6]) / 2
+            dd = math.sqrt((xm - cam.x) ** 2 + (ym - cam.y) ** 2 + (zm - cam.z) ** 2)
+            if dd > 2300 or dist(xm, ym, zm) < -120:
+                continue
+            bias = 0.7 * max(q[2] - q[1], q[4] - q[3]) / 2.0
+            items.append((dd + bias, 0, q))
+        for h in o["H"]:
+            hp = ob_hpos(h, T)
+            dd = math.sqrt((hp[0] - cam.x) ** 2 + (hp[1] - cam.y) ** 2 + (hp[2] - cam.z) ** 2)
+            if dd < 2000:
+                items.append((dd, 1, h))
+        for i, c in enumerate(o["cps"]):
+            dd = math.sqrt((c[0] - cam.x) ** 2 + (c[1] - cam.y) ** 2 + (c[2] - cam.z) ** 2)
+            if dd < 1800:
+                items.append((dd - 30, 2, (c, i <= o["cp"])))
+        for d in C["dec"]:
+            zc = (d.get("z0", d.get("z", 0)) + d.get("z1", d.get("z", 0))) / 2.0
+            dd = math.sqrt((d["x"] - cam.x) ** 2 + (d["y"] - cam.y) ** 2 + (zc - cam.z) ** 2)
+            if dd < 2300 and dist(d["x"], d["y"], zc) > -80:
+                items.append((dd + 120, 3, d))
+        me_gz = self.ob_ground(sol, o["x"], o["y"], o["z"])
+        items.append((math.sqrt((o["x"] - cam.x) ** 2 + (o["y"] - cam.y) ** 2 + (o["z"] + 10 - cam.z) ** 2) - 6, 4, None))
+        pl = self.obmp["pl"] if self.obmp else {}
+        me_id = self.obmp["me"] if self.obmp else -1
+        for pid, p in pl.items():
+            if pid == me_id or "dx" not in p:
+                continue
+            items.append((math.sqrt((p["dx"] - cam.x) ** 2 + (p["dy"] - cam.y) ** 2 + (p["dz"] + 10 - cam.z) ** 2) - 6, 5, p))
+        items.sort(key=lambda a: -a[0])
+        self.labels = []
+        fcx, fcy, fcz = cam.x, cam.y, cam.z
+        for dd, kind, q in items:
+            self.ob_fk = 0.0
+            if kind in (0, 3):
+                if kind == 0:
+                    qx, qy, qz = (q[1] + q[2]) / 2, (q[3] + q[4]) / 2, q[6]
+                else:
+                    qx, qy, qz = q["x"], q["y"], q.get("z", q.get("z1", 0))
+                self.ob_fk = clamp((math.sqrt((qx - fcx) ** 2 + (qy - fcy) ** 2 + (qz - fcz) ** 2) - 380.0) / 1700.0, 0.0, 0.8)
+            if kind == 0:
+                self.ob_box(r, cam, q, T, t)
+            elif kind == 1:
+                self.ob_hazard(r, cam, q, T, t)
+            elif kind == 2:
+                self.ob_flag(r, q[0], t, q[1])
+            elif kind == 3:
+                self.ob_decor(r, cam, q, t, T)
+            elif kind == 4:
+                if o["dead"] <= 0:
+                    self.ob_orb(r, cam, o["x"], o["y"], o["z"], tuple(self.pcol()), "", "", t, True, me_gz, 0.0)
+            else:
+                self.ob_orb(r, cam, q["dx"], q["dy"], q["dz"], tuple(q.get("col", WHITE))[:3], str(q.get("name", "?")), "", t, False, self.ob_ground(sol, q["dx"], q["dy"], q["dz"]), q.get("pid", 1))
+        for sp in o["sparks"]:
+            r.dot(sp[0], sp[1], sp[2], 2.2, sp[7])
+        for i in range(34):
+            ph = i * 0.6180339
+            ex = o["cx"] + ((ph * 971) % 520) - 260 + math.sin(t * 0.7 + i) * 14
+            ey = o["cy"] + ((ph * 613) % 520) - 260
+            ez = o["cz"] - 60 + ((t * 26 + i * 53) % 320)
+            r.dot(ex, ey, ez, 1.4, (255, 150 + i % 3 * 30, 70))
+        for lb in self.labels:
+            if lb[0] == 0:
+                draw_text(s, lb[1], lb[2], lb[3], lb[4], lb[5])
+            else:
+                pygame.draw.circle(s, lb[4], (lb[1], lb[2]), lb[3] + 1, 1)
+        glow(s, W // 2, int(H * 1.0), 520, (255, 40, 50), 0.22)
+
+    def ob_decor(self, r, cam, d, t, T):
+        """the factory around the course: pillars, vats with things in them, gears and chains"""
+        k = d["t"]
+        x, y = d["x"], d["y"]
+        if k == "pil":
+            w = d["w"]
+            self.ob_cuboid(r, cam, x - w, x + w, y - w, y + w, d["z0"], d["z1"], (54, 24, 34), (46, 18, 28), (36, 14, 22), False)
+            zz = d["z0"] + 40 + (d["s"] * 300) % 300
+            for j in range(3):
+                z = zz + j * 90
+                if z < d["z1"]:
+                    c = (255, 70, 70) if math.sin(t * 2 + d["s"] * 9 + j) > -0.2 else (110, 30, 36)
+                    r.dot(x + (w + 1 if cam.x > x else -w - 1), y, z, 3.2, c, 0.4)
+        elif k == "tank":
+            rad, z0, z1 = d["rad"], d["z0"], d["z1"]
+            n = 9
+            pts0 = [(x + math.cos(i * TAU / n) * rad, y + math.sin(i * TAU / n) * rad) for i in range(n)]
+            order = sorted(range(n), key=lambda i: -((pts0[i][0] - cam.x) ** 2 + (pts0[i][1] - cam.y) ** 2))
+            for i in order:
+                a, b = pts0[i], pts0[(i + 1) % n]
+                nx, ny = (a[0] + b[0]) / 2 - x, (a[1] + b[1]) / 2 - y
+                if nx * (cam.x - x) + ny * (cam.y - y) < -rad * rad * 0.2:
+                    continue
+                lit = 0.6 + 0.4 * math.sin(i * 0.7 + 1)
+                r.poly([(a[0], a[1], z0), (b[0], b[1], z0), (b[0], b[1], z1), (a[0], a[1], z1)], mix_col((70, 12, 22), (170, 28, 42), lit))
+            r.lines([(p[0], p[1], z1) for p in pts0], (120, 130, 150), 2, True)
+            r.lines([(p[0], p[1], z0) for p in pts0], (120, 130, 150), 2, True)
+            # something is swimming in there
+            mz = (z0 + z1) / 2 + math.sin(t * 0.9 + d["s"] * 20) * 12
+            r.dot(x, y, mz, rad * 0.32, (34, 6, 12))
+            r.dot(x, y, mz + rad * 0.4, rad * 0.2, (34, 6, 12))
+            if math.sin(t * 2.0 + d["s"] * 30) > 0.3:
+                r.dot(x - 6, y, mz + rad * 0.42, 2.2, (255, 220, 100))
+                r.dot(x + 6, y, mz + rad * 0.42, 2.2, (255, 220, 100))
+        elif k == "gear":
+            rad = d["rad"]
+            a0 = t * d["sp"] + d["s"] * 6
+            pts = []
+            teeth = 12
+            for i in range(teeth * 2):
+                a = a0 + i * math.pi / teeth
+                rr = rad if i % 2 == 0 else rad * 0.84
+                for da in (0.0, 0.5):
+                    aa = a + da * math.pi / teeth * 0.8
+                    c, sn = math.cos(aa) * rr, math.sin(aa) * rr
+                    pts.append((x, y + c, d["z"] + sn) if d["nx"] else (x + c, y, d["z"] + sn))
+            r.poly(pts, (52, 20, 28), (130, 60, 70))
+            hub = [(x, y + math.cos(a0 + i) * rad * 0.2, d["z"] + math.sin(a0 + i) * rad * 0.2) if d["nx"] else (x + math.cos(a0 + i) * rad * 0.2, y, d["z"] + math.sin(a0 + i) * rad * 0.2) for i in range(6)]
+            r.poly(hub, (90, 36, 44))
+        else:
+            z0, z1 = d["z0"], d["z1"]
+            r.line((x, y, z0), (x, y, z1), (70, 72, 90), 2)
+            z = z0
+            while z < z1:
+                r.dot(x, y, z, 2.6, (100, 104, 126))
+                z += 22
+            r.dot(x, y, z0 - 6, 6, (84, 86, 104))
+
+    def screen_mymaps(self, s):
+        self.draw_plain(s)
+        sv = self.save
+        if self.tab_header("mymaps"):
+            return
+        if self.back_button("lobby"):
+            return
+        L = self.my_maps
+        n = len(L)
+        self.sel_my = int(clamp(self.sel_my, 0, n))         # n = the NEW MAP card
+        draw_text(s, "Draw your own roads and hills, play them, and send them to a friend with a code.", 17, GREY, W // 2, 92)
+        for i in range(min(CUSTOM_MAX, n + 1)):
+            r = pygame.Rect(34 + (i % 7) * 174, 112 + (i // 7) * 134, 166, 126)
+            on = self.sel_my == i
+            hov = r.collidepoint(self.mouse)
+            if i < n:
+                m = L[i]
+                th = THEMES[m["theme"]]
+                pygame.draw.rect(s, mix_col(PANEL, th["accent"], 0.20 if on else 0.08 if hov else 0.03), r, border_radius=10)
+                pygame.draw.rect(s, WHITE if on else th["accent"] if hov else LINE, r, 2, border_radius=10)
+                self.draw_minimap(s, m, pygame.Rect(r.x + 8, r.y + 8, r.w - 16, 84), th["accent"])
+                draw_text(s, m["name"], 16, WHITE, r.centerx, r.y + 106)
+            else:
+                pygame.draw.rect(s, mix_col(PANEL, GREEN, 0.18 if on else 0.08 if hov else 0.03), r, border_radius=10)
+                pygame.draw.rect(s, WHITE if on else GREEN if hov else LINE, r, 2, border_radius=10)
+                draw_text(s, "+", 64, GREEN, r.centerx, r.y + 52)
+                draw_text(s, "NEW MAP", 18, WHITE, r.centerx, r.y + 106)
+            if hov and self.click:
+                self.click = False
+                self.audio.play("click")
+                self.sel_my = i
+        D = pygame.Rect(34, 404, W - 68, 290)
+        if self.sel_my >= n:
+            panel(s, D, PANEL, 255, GREEN, 14, 2)
+            draw_text(s, "NEW MAP", 38, GREEN, D.x + 24, D.y + 40, "l")
+            draw_text(s, "Start with an empty map. Draw one or two roads, raise some hills, pick a look, and test it.", 19, GREY, D.x + 24, D.y + 80, "l")
+            if self.button("my_new", pygame.Rect(D.x + 24, D.y + 120, 300, 70), "DRAW A NEW MAP", GREEN, 28, n < CUSTOM_MAX):
+                self.ed_open(dict(name="MY MAP %d" % (n + 1), theme="GRID", paths=[[]], cliffs=[]), -1)
+                return
+            if n >= CUSTOM_MAX:
+                draw_text(s, "You have %d maps. Delete one to make room." % CUSTOM_MAX, 17, ORANGE, D.x + 24, D.y + 206, "l")
+        else:
+            m = L[self.sel_my]
+            c = m["raw"]
+            th = THEMES[m["theme"]]
+            panel(s, D, PANEL, 255, th["accent"], 14, 2)
+            self.draw_minimap(s, m, pygame.Rect(D.x + 20, D.y + 20, 406, 250), th["accent"])
+            x = D.x + 450
+            draw_text(s, m["name"], 38, th["accent"], x, D.y + 36, "l")
+            draw_text(s, "%s look   -   %d road%s   -   %d hills" % (m["theme"], len(m["paths"]), "" if len(m["paths"]) == 1 else "s", len(c["cliffs"])), 18, GREY, x, D.y + 72, "l")
+            for j, d in enumerate(DIFF_ORDER):
+                DD = DIFFS[d]
+                r = pygame.Rect(x + j * 136, D.y + 100, 128, 56)
+                on = sv["diff"] == d
+                if self.button("mdiff_" + d, r, DD["name"], DD["col"] if on else GREY, 22, True, None, mix_col(PANEL, DD["col"], 0.2) if on else None):
+                    sv["diff"] = d
+            B = pygame.Rect(D.right - 250, D.y + 100, 226, 90)
+            if self.button("my_play", B, "PLAY", GREEN, 40, True, "no coins on your own maps"):
+                self.store()
+                self.start_game(m["id"], sv["diff"])
+                return
+            if self.button("my_edit", pygame.Rect(x, D.y + 176, 130, 50), "EDIT", CYAN, 24):
+                self.ed_open(json.loads(json.dumps(c)), self.sel_my)
+                return
+            if self.button("my_share", pygame.Rect(x + 140, D.y + 176, 200, 50), "COPY MAP CODE", GOLD, 20):
+                ok = clip_put(custom_code(c))
+                self.pop("Map code copied. Paste it to a friend." if ok else "Could not use the clipboard", GREEN if ok else RED)
+            sure = self.my_del == m["id"] and self.time < self.my_del_t
+            if self.button("my_del", pygame.Rect(x + 350, D.y + 176, 160, 50), "REALLY?" if sure else "DELETE", RED, 22):
+                if sure:
+                    sv["mymaps"].pop(self.sel_my)
+                    self.store()
+                    self.reload_mymaps()
+                    self.my_del = None
+                else:
+                    self.my_del = m["id"]
+                    self.my_del_t = self.time + 3.0
+            self.draw_text_note(s, "Friends get it automatically when you pick it in a Wi-Fi room.", x, D.y + 246)
+        if self.button("my_import", pygame.Rect(D.right - 250, D.y + 206, 226, 60), "PASTE A MAP CODE", MINT, 20, True, "from your clipboard"):
+            c, why = custom_from_code(clip_get())
+            if c is None:
+                self.pop(why, RED)
+            else:
+                i = self.my_save(c)
+                if i < 0:
+                    self.pop("You have %d maps. Delete one first." % CUSTOM_MAX, RED)
+                else:
+                    self.sel_my = i
+                    self.pop("Map added: " + c["name"], GREEN)
+
+    def draw_text_note(self, s, txt, x, y):
+        draw_text(s, txt, 15, DIM, x, y, "l")
+
+    # ------------------------------------------------------------ the map editor
+    ED_GX, ED_GY, ED_CS = 24, 92, 36
+
+    def ed_open(self, c, idx):
+        paths = [[list(q) + [0] * (4 - len(q)) for q in p] for p in c.get("paths", [[]])]
+        while len(paths) < 2:
+            paths.append([])
+        self.ed = dict(name=c["name"], theme=c["theme"], paths=paths, cliffs=[list(q) for q in c["cliffs"]], idx=idx, tool="road", road=0, lv=0, hill=1,
+                       bridge=False, drag=None, msg="", msg_t=0.0, dirty=False, bye=0.0)
+        self.goto("editor")
+
+    def ed_raw(self):
+        E = self.ed
+        return dict(name=E["name"], theme=E["theme"], paths=[p for p in E["paths"] if p], cliffs=E["cliffs"])
+
+    def ed_say(self, txt, col=ORANGE):
+        self.ed["msg"], self.ed["msg_col"], self.ed["msg_t"] = txt, col, self.time + 6.0
+
+    def ed_add_point(self, c, r):
+        E = self.ed
+        p = E["paths"][E["road"]]
+        if len(p) >= 40:
+            self.ed_say("That road has enough corners.")
+            return
+        lv = E["lv"]
+        if not p:
+            # a road starts at the edge of the map
+            if c == 0:
+                c = -1
+            elif c == COLS - 1:
+                c = COLS
+            elif r == 0:
+                r = -1
+            elif r == ROWS - 1:
+                r = ROWS
+            p.append([c, r, lv, 0])
+            E["dirty"] = True
+            return
+        lc, lr, llv, _ = p[-1]
+        if (c, r) == (lc, lr):
+            return
+        br = 1 if E["bridge"] else 0
+        if c != lc and r != lr:
+            p[-1][3] = br
+            p.append([c, lr, llv, 0])
+            lc = c
+        p[-1][3] = br
+        p.append([c, r, lv, 0])
+        E["dirty"] = True
+
+    def ed_apply_hills(self):
+        """the hills as a grid: (column, row) -> level"""
+        hm = {}
+        for c0, r0, c1, r1, lv in self.ed["cliffs"]:
+            for c in range(c0, c1 + 1):
+                for r in range(r0, r1 + 1):
+                    if lv <= 0:
+                        hm.pop((c, r), None)
+                    else:
+                        hm[(c, r)] = lv
+        return hm
+
+    def ed_check(self):
+        c = custom_clean(self.ed_raw())
+        if c is None:
+            return None, "Draw a road first: pick ROAD and click the edge of the map."
+        why = custom_problem(c)
+        return (None, why) if why else (c, "")
+
+    def screen_editor(self, s):
+        E = self.ed
+        self.draw_plain(s)
+        th = THEMES[E["theme"]]
+        GX, GY, CS = self.ED_GX, self.ED_GY, self.ED_CS
+        grid = pygame.Rect(GX, GY, COLS * CS, ROWS * CS)
+        # --- the top bar
+        draw_glow_text(s, "MAP EDITOR", 44, GREEN, W // 2 - 120, 44)
+        sure = E["bye"] > self.time
+        lab = "SURE? NOT SAVED" if (sure and E["dirty"]) else "< BACK"
+        if self.button("ed_back", pygame.Rect(28, 24, 200 if sure and E["dirty"] else 120, 44), lab, ORANGE if sure else GREY, 22 if sure else 24) or (pygame.K_ESCAPE in self.pressed and self.focus is None):
+            if E["dirty"] and not sure:
+                E["bye"] = self.time + 3.0
+            else:
+                self.goto("mymaps")
+                return
+        # --- the map
+        pygame.draw.rect(s, mix_col(th["ground"], (0, 0, 0), 0.2), grid)
+        hm = self.ed_apply_hills()
+        for (c, r), lv in hm.items():
+            col = scale_col(th["cliff"], 0.7 + 0.3 * lv)
+            pygame.draw.rect(s, col, (GX + c * CS, GY + r * CS, CS, CS))
+            draw_text(s, str(lv), 14, mix_col(col, WHITE, 0.55), GX + c * CS + CS // 2, GY + r * CS + CS // 2)
+        for c in range(COLS + 1):
+            pygame.draw.line(s, th["grid"], (GX + c * CS, GY), (GX + c * CS, GY + ROWS * CS))
+        for r in range(ROWS + 1):
+            pygame.draw.line(s, th["grid"], (GX, GY + r * CS), (GX + COLS * CS, GY + r * CS))
+        prev = s.get_clip()
+        s.set_clip(grid)
+        shades = (0.55, 0.8, 1.0, 1.25)
+        for pi, p in enumerate(E["paths"]):
+            act = pi == E["road"]
+            for a, b in zip(p, p[1:]):
+                pa = (GX + (a[0] + 0.5) * CS, GY + (a[1] + 0.5) * CS)
+                pb = (GX + (b[0] + 0.5) * CS, GY + (b[1] + 0.5) * CS)
+                hi = max(a[2], b[2])
+                pygame.draw.line(s, scale_col(th["accent"], (0.45 if not act else 0.7) * shades[hi]), pa, pb, 22)
+                pygame.draw.line(s, th["road"], pa, pb, 16)
+                if a[2] != b[2]:
+                    for k in range(1, 6):
+                        q = (pa[0] + (pb[0] - pa[0]) * k / 6.0, pa[1] + (pb[1] - pa[1]) * k / 6.0)
+                        pygame.draw.circle(s, scale_col(th["accent"], 0.8), q, 3)
+                if a[3]:
+                    for k in range(0, 10):
+                        q = (pa[0] + (pb[0] - pa[0]) * k / 9.0, pa[1] + (pb[1] - pa[1]) * k / 9.0)
+                        pygame.draw.circle(s, WHITE, q, 2)
+            for i, q in enumerate(p):
+                pt = (int(GX + (q[0] + 0.5) * CS), int(GY + (q[1] + 0.5) * CS))
+                pygame.draw.circle(s, th["accent"] if act else GREY, pt, 8, 2)
+                draw_text(s, str(q[2]), 12, WHITE, pt[0], pt[1])
+        s.set_clip(prev)
+        # where roads begin and where the core is
+        for pi, p in enumerate(E["paths"]):
+            if p:
+                q = p[0]
+                draw_text(s, "ROAD %d" % (pi + 1), 13, WHITE, min(max(GX + (q[0] + 0.5) * CS, GX + 28), GX + COLS * CS - 28), min(max(GY + (q[1] + 0.5) * CS - 16, GY + 10), GY + ROWS * CS - 10))
+        end = next((p[-1] for p in E["paths"] if p), None)
+        if end is not None:
+            ex, ey = GX + (end[0] + 0.5) * CS, GY + (end[1] + 0.5) * CS
+            pygame.draw.circle(s, th["accent"], (int(ex), int(ey)), 15)
+            pygame.draw.circle(s, WHITE, (int(ex), int(ey)), 15, 2)
+            draw_text(s, "CORE", 11, (0, 0, 0), ex, ey)
+        pygame.draw.rect(s, LINE, grid, 2)
+        # --- the mouse on the map
+        mx, my = self.mouse
+        over = grid.collidepoint(mx, my) and not self.lock
+        cc, rr = (mx - GX) // CS, (my - GY) // CS
+        if over:
+            if E["tool"] == "road":
+                pygame.draw.rect(s, WHITE, (GX + cc * CS, GY + rr * CS, CS, CS), 2)
+                if self.click:
+                    self.click = False
+                    self.ed_add_point(int(cc), int(rr))
+                if self.rclick and E["paths"][E["road"]]:
+                    E["paths"][E["road"]].pop()
+                    E["dirty"] = True
+            else:
+                if self.click:
+                    self.click = False
+                    E["drag"] = (int(cc), int(rr))
+        if E["drag"] is not None:
+            a = E["drag"]
+            b = (int(clamp(cc, 0, COLS - 1)), int(clamp(rr, 0, ROWS - 1)))
+            x0, x1, y0, y1 = min(a[0], b[0]), max(a[0], b[0]), min(a[1], b[1]), max(a[1], b[1])
+            pygame.draw.rect(s, GREEN if E["tool"] == "hill" else RED, (GX + x0 * CS, GY + y0 * CS, (x1 - x0 + 1) * CS, (y1 - y0 + 1) * CS), 3)
+            if not self.mdown:
+                E["cliffs"].append([x0, y0, x1, y1, E["hill"] if E["tool"] == "hill" else 0])
+                if len(E["cliffs"]) > 80:
+                    del E["cliffs"][0]
+                E["drag"] = None
+                E["dirty"] = True
+        # --- the side panel
+        X, Wd = 984, 272
+        E["name"] = self.textbox("ed_name", pygame.Rect(X, 92, Wd, 40), E["name"], 16, "name of the map", 22)
+        if self.focus == "ed_name":
+            E["dirty"] = True
+        names = list(THEMES)
+        i = names.index(E["theme"])
+        if self.button("ed_th_l", pygame.Rect(X, 140, 40, 34), "<", GREY, 22):
+            E["theme"] = names[(i - 1) % len(names)]
+            E["dirty"] = True
+        if self.button("ed_th_r", pygame.Rect(X + Wd - 40, 140, 40, 34), ">", GREY, 22):
+            E["theme"] = names[(i + 1) % len(names)]
+            E["dirty"] = True
+        draw_text(s, "LOOK: " + E["theme"], 17, th["accent"], X + Wd // 2, 157)
+        for j, (key, lab, col) in enumerate((("road", "ROAD", CYAN), ("hill", "HILL", GREEN), ("flat", "FLATTEN", RED))):
+            r = pygame.Rect(X + j * 92, 184, 88, 40)
+            on = E["tool"] == key
+            if self.button("ed_t_" + key, r, lab, col if on else GREY, 18, True, None, mix_col(PANEL, col, 0.25) if on else None):
+                E["tool"] = key
+                E["drag"] = None
+        y = 236
+        if E["tool"] == "road":
+            for j in range(2):
+                r = pygame.Rect(X + j * 140, y, 132, 34)
+                on = E["road"] == j
+                if self.button("ed_r%d" % j, r, "ROAD %d" % (j + 1), CYAN if on else GREY, 18, True, None, mix_col(PANEL, CYAN, 0.25) if on else None):
+                    E["road"] = j
+            draw_text(s, "HEIGHT OF THE NEXT POINT", 14, DIM, X + Wd // 2, y + 52)
+            for j in range(4):
+                r = pygame.Rect(X + j * 69, y + 64, 65, 34)
+                on = E["lv"] == j
+                if self.button("ed_lv%d" % j, r, str(j), GOLD if on else GREY, 20, True, None, mix_col(PANEL, GOLD, 0.25) if on else None):
+                    E["lv"] = j
+            on = E["bridge"]
+            if self.button("ed_br", pygame.Rect(X, y + 108, Wd, 34), "BRIDGE (open underneath): " + ("ON" if on else "OFF"), MINT if on else GREY, 16, True, None, mix_col(PANEL, MINT, 0.25) if on else None):
+                E["bridge"] = not E["bridge"]
+            if self.button("ed_undo", pygame.Rect(X, y + 150, 132, 34), "UNDO POINT", ORANGE, 16):
+                if E["paths"][E["road"]]:
+                    E["paths"][E["road"]].pop()
+                    E["dirty"] = True
+            if self.button("ed_clr", pygame.Rect(X + 140, y + 150, 132, 34), "CLEAR ROAD", RED, 16):
+                E["paths"][E["road"]] = []
+                E["dirty"] = True
+            for k, t in enumerate(("Click the map edge to start a road,", "then click where it turns. Right click undoes.", "Different heights make a ramp. A road that",
+                                   "crosses over another one is a bridge.", "Road 2 is optional: it must end on the core.")):
+                draw_text(s, t, 13, GREY, X, y + 206 + k * 18, "l")
+        else:
+            draw_text(s, "HILL HEIGHT" if E["tool"] == "hill" else "DRAG A BOX TO FLATTEN IT", 14, DIM, X + Wd // 2, y + 8)
+            if E["tool"] == "hill":
+                for j in range(3):
+                    r = pygame.Rect(X + j * 92, y + 24, 88, 38)
+                    on = E["hill"] == j + 1
+                    if self.button("ed_h%d" % j, r, str(j + 1), GREEN if on else GREY, 22, True, None, mix_col(PANEL, GREEN, 0.25) if on else None):
+                        E["hill"] = j + 1
+            if self.button("ed_hundo", pygame.Rect(X, y + 76, 132, 34), "UNDO BOX", ORANGE, 16):
+                if E["cliffs"]:
+                    E["cliffs"].pop()
+                    E["dirty"] = True
+            if self.button("ed_hclr", pygame.Rect(X + 140, y + 76, 132, 34), "CLEAR ALL", RED, 16):
+                E["cliffs"] = []
+                E["dirty"] = True
+            for k, t in enumerate(("Drag a box on the map.", "Tall hills let cliff towers see far.", "Keep roads off hills: land next to a road",
+                                   "is never taller than the road.")):
+                draw_text(s, t, 13, GREY, X, y + 128 + k * 18, "l")
+        if E["msg"] and self.time < E["msg_t"]:
+            for k, line in enumerate(wrap(E["msg"], 14, Wd)):
+                draw_text(s, line, 14, E.get("msg_col", ORANGE), X, 508 + k * 17, "l")
+        if self.button("ed_save", pygame.Rect(X, 566, Wd, 44), "SAVE", GREEN, 26):
+            c, why = self.ed_check()
+            if c is None:
+                self.ed_say(why)
+            else:
+                old = E["idx"]
+                if old >= 0 and old < len(self.save["mymaps"]) and self.save["mymaps"][old]["name"] != c["name"]:
+                    self.save["mymaps"].pop(old)
+                i = self.my_save(c)
+                if i < 0:
+                    self.ed_say("You have %d maps. Delete one first." % CUSTOM_MAX)
+                else:
+                    E["idx"] = i
+                    E["dirty"] = False
+                    self.ed_say("Saved.", GREEN)
+                    self.sel_my = i
+        if self.button("ed_test", pygame.Rect(X, 618, Wd, 44), "SAVE + TEST PLAY", GOLD, 22):
+            c, why = self.ed_check()
+            if c is None:
+                self.ed_say(why)
+            else:
+                old = E["idx"]
+                if old >= 0 and old < len(self.save["mymaps"]) and self.save["mymaps"][old]["name"] != c["name"]:
+                    self.save["mymaps"].pop(old)
+                i = self.my_save(c)
+                if i >= 0:
+                    self.sel_my = i
+                    E["idx"] = i
+                    E["dirty"] = False
+                    self.start_game(custom_map(c)["id"], self.save["diff"])
+                    return
+
     # ------------------------------------------------------------ events
     def screen_events(self, s):
         self.draw_plain(s)
@@ -16040,10 +21234,13 @@ class Game:
             return
         draw_text(s, "Beat an event level to earn its tower.  Seasons follow the calendar.  Secret events are hidden on the maps: talk to people.", 17, GREY, W // 2, 92)
         now = time.time()
-        for i, ev in enumerate(EVENT_ORDER):
+        vis = [ev for ev in EVENT_ORDER if ev != "blood" or "blood" in sv["events"] or sv["bf"].get("called")]
+        for i, ev in enumerate(vis):
             E = EVENTS[ev]
             m = MAP_BY_ID[ev]
             state, left = event_state(sv, ev, now)
+            if ev == "blood" and "blood" not in sv["events"]:
+                state = "called"
             r = pygame.Rect(34 + (i % 4) * 304, 116 + (i // 4) * 292, 296, 280)
             col = E["col"]
             known = state != "locked" or E["kind"] == "season"
@@ -16053,12 +21250,12 @@ class Game:
             have = sv["etowers"].get(kind)
             if known:
                 draw_text(s, E["name"], 24, col, r.x + 16, r.y + 24, "l")
-                self.draw_minimap(s, m, pygame.Rect(r.x + 16, r.y + 46, 150, 92), col, state == "locked")
+                self.draw_minimap(s, m, pygame.Rect(r.x + 16, r.y + 46, 150, 92), col, state in ("locked", "called"))
             else:
                 draw_text(s, "? ? ?", 24, DIM, r.x + 16, r.y + 24, "l")
                 pygame.draw.rect(s, (10, 12, 26), (r.x + 16, r.y + 46, 150, 92), border_radius=6)
                 draw_text(s, "?", 60, (30, 36, 66), r.x + 91, r.y + 92)
-            self.chip("SEASON" if E["kind"] == "season" else "SECRET", col if known else DIM, r.right - 80, r.y + 24, 13)
+            self.chip("SEASON" if E["kind"] == "season" else "SPECIAL" if E["kind"] == "special" else "SECRET", col if known else DIM, r.right - 80, r.y + 24, 13)
             # the prize
             if known:
                 self.tower_icon(kind, r.x + 232, r.y + 92, 1.5, 4 if have else 0, 0.5, not have)
@@ -16069,10 +21266,16 @@ class Game:
             if state == "season":
                 draw_text(s, "%s IS ON   -   %d day%s left" % (E["label"], left, "" if left == 1 else "s"), 16, GREEN, r.x + 16, y, "l")
                 draw_text(s, "Win now for the REAL tower.", 14, GREY, r.x + 16, y + 20, "l")
+            elif state == "live" and E["kind"] == "special":
+                draw_text(s, "OPEN   -   no time limit", 16, GREEN, r.x + 16, y, "l")
+                draw_text(s, "Survive 40 waves. Face DESOLATION.", 14, GREY, r.x + 16, y + 20, "l")
             elif state == "live":
                 d, h = int(left // 86400), int(left % 86400 // 3600)
                 draw_text(s, "LIVE   -   %dd %dh left" % (d, h), 16, GREEN, r.x + 16, y, "l")
                 draw_text(s, "Win before it ends for the REAL tower.", 14, GREY, r.x + 16, y + 20, "l")
+            elif state == "called":
+                draw_text(s, "A SHADOW IS WAITING FOR YOU", 16, (255, 90, 100), r.x + 16, y, "l")
+                draw_text(s, "He has something to show you.", 14, GREY, r.x + 16, y + 20, "l")
             elif state == "late":
                 draw_text(s, "OUT OF SEASON" if E["kind"] == "season" else "THE EVENT IS OVER", 16, GOLD, r.x + 16, y, "l")
                 draw_text(s, "Still playable. The prize is a RIPOFF.", 14, GREY, r.x + 16, y + 20, "l")
@@ -16086,16 +21289,25 @@ class Game:
                 for j, ln in enumerate(wrap("Rumour: " + E["hint"], 14, r.w - 32)[:2]):
                     draw_text(s, ln, 14, GREY, r.x + 16, y + 20 + j * 16, "l")
             done = sv["edone"].get(ev, 0)
-            draw_text(s, ("Beaten %d time%s" % (done, "" if done == 1 else "s")) if done else "25 waves   -   800 coins   -   title: " + TITLES[E["title"]][0], 13, GOLD if done else DIM, r.x + 16, r.bottom - 68, "l")
+            draw_text(s, ("Beaten %d time%s" % (done, "" if done == 1 else "s")) if done else "%d waves   -   %d coins   -   title: %s" % (m.get("waves", 25), m.get("coins", 800), TITLES[E["title"]][0]), 13, GOLD if done else DIM, r.x + 16, r.bottom - 68, "l")
             B = pygame.Rect(r.x + 16, r.bottom - 54, r.w - 32 - 96, 42)
             if state == "locked":
                 self.button("ev_" + ev, B, "LOCKED", GREY, 20, False)
+            elif state == "called":
+                if self.button("ev_" + ev, B, "MEET HIM", col, 24):
+                    self.cs_start(choice_only=bool(sv["bf"].get("met")))
+                    return
             elif self.button("ev_" + ev, B, "PLAY", col, 24):
-                self.start_game(ev, "event")
+                if ev == "blood":
+                    self.bf_enter()
+                else:
+                    self.start_game(ev, "event")
                 return
-            if known and self.button("evg_" + ev, pygame.Rect(B.right + 8, B.y, 88, 42), "TUTORIAL", PINK, 13):
+            if known and ev != "blood" and self.button("evg_" + ev, pygame.Rect(B.right + 8, B.y, 88, 42), "TUTORIAL", PINK, 13):
                 self.start_video(ev, "event", "events")
         r = pygame.Rect(34 + 3 * 304, 116 + 292, 296, 280)
+        if len(vis) >= 8:
+            return
         panel(s, r, PANEL, 255, LINE, 14, 2)
         lines = ["HOW EVENTS WORK", "", "A tower earned while its event is", "on keeps its real name forever.", "",
                  "Earn it after the event is over", "and it is called a RIPOFF.", "Same tower, different name.", "",
@@ -16144,8 +21356,9 @@ class Game:
         draw_text(s, "One for every map on every difficulty. The bot plays the whole match live with the cheapest setup that wins: watch where things go.", 17, GREY, W // 2, 88)
         lv = self.level()
         have = self.have_towers()
-        self.sel_guide = clamp(self.sel_guide, 0, len(MAPS) - 1)
-        for i, m in enumerate(MAPS):
+        GM = [m for m in MAPS if not m.get("secret")]
+        self.sel_guide = clamp(self.sel_guide, 0, len(GM) - 1)
+        for i, m in enumerate(GM):
             r = pygame.Rect(34 + (i % 7) * 174, 104 + (i // 7) * 98, 166, 92)
             th = THEMES[m["theme"]]
             on = self.sel_guide == i
@@ -16160,7 +21373,7 @@ class Game:
                 self.click = False
                 self.audio.play("click")
                 self.sel_guide = i
-        m = MAPS[self.sel_guide]
+        m = GM[self.sel_guide]
         th = THEMES[m["theme"]]
         D = pygame.Rect(34, 404, W - 68, 290)
         panel(s, D, PANEL, 255, th["accent"], 14, 2)
@@ -16942,8 +22155,8 @@ class Game:
                 draw_text(s, E["name"], 20, E["col"], x + 58, y - 10, "l")
                 if E.get("boss"):
                     draw_text(s, "BOSS", 14, RED, x + 250, y - 10, "l")
-                elif kind in WAVE_UNITS:
-                    draw_text(s, "from wave %d" % WAVE_UNITS[kind][0], 14, DIM, x + 250, y - 10, "l")
+                elif kind in WAVE_UNITS or kind in AIR_UNITS:
+                    draw_text(s, "from wave %d" % (WAVE_UNITS.get(kind) or AIR_UNITS[kind])[0], 14, DIM, x + 250, y - 10, "l")
                 draw_text(s, E["info"], 16, GREY, x + 58, y + 10, "l")
         elif tab == 3:
             keys = [(self.kmove(True), "move your orb (3D view)     %s: sprint (hold)     %s: jump" % (kn("sprint"), kn("jump"))),
@@ -17194,7 +22407,7 @@ class Game:
             return
         self.net = ("host", Hh)
         self.mp_err = ""
-        self.room = dict(map=MAIN_MAPS[clamp(self.sel_map, 0, len(MAIN_MAPS) - 1)]["id"], diff=self.save["diff"], players=[], ip=Hh.ip, port=Hh.port)
+        self.room = dict(map=MAIN_MAPS[clamp(self.sel_map, 0, len(MAIN_MAPS) - 1)]["id"], diff=self.save["diff"], players=[], ip=Hh.ip, port=Hh.port, vs=False)
         self.room_specs = {0: self.my_spec()}
         self.chat = []
         self.chat_add("", GREY, "Room open. Friends on your Wi-Fi can join now.")
@@ -17225,6 +22438,22 @@ class Game:
         else:
             self.net[1].send(dict(t="spec", spec=self.my_spec()))
 
+    def guest_start(self, m):
+        """the host started the match"""
+        self.take_cmap(m)
+        self.start_guest(m["map"], m["diff"], m["specs"], int(m["me"]))
+        if m.get("vs"):
+            self.world.vs = dict(i=int(m.get("idx", 0)), info=[], inc=0)
+            self.world.nwaves = VS_WAVES
+
+    def take_cmap(self, m):
+        """the host is playing a map somebody drew: learn it (it is checked like any other map code)"""
+        c = m.get("cmap")
+        if isinstance(c, dict):
+            c = custom_clean(c)
+            if c is not None and not custom_problem(c):
+                m["map"] = custom_map(c)["id"]
+
     def room_broadcast(self):
         Hh = self.net[1]
         ids = [0] + sorted(Hh.conns)
@@ -17235,18 +22464,23 @@ class Game:
                            col=list(sp.get("col", WHITE))[:3], loadout=[k for k in sp.get("loadout", []) if k in TOWERS][:6]))
         self.room["players"] = pl
         for pid, c in Hh.conns.items():
-            c.send(dict(t="room", map=self.room["map"], diff=self.room["diff"], players=pl, you=pid))
+            c.send(dict(t="room", map=self.room["map"], cmap=MAP_BY_ID[self.room["map"]].get("raw"), diff=self.room["diff"], players=pl, you=pid, vs=bool(self.room.get("vs"))))
 
     def net_idle(self):
         """keeps the Wi-Fi alive while you are on another screen"""
         if not self.net:
             return
         w = self.world
+        if self.obmp is not None and w is None:
+            self.obmp_pump()
+            return
         if self.net[0] == "host":
             Hh = self.net[1]
             if w is not None:
                 self.host_pump(w)
                 w.update(min(self.dt, 1 / 30.0))
+                if self.vsm is not None:
+                    self.vs_step(w)
                 self.mp_auto(w)
                 del w.ev[:]
                 return
@@ -17313,6 +22547,7 @@ class Game:
                 t = m.get("t")
                 try:
                     if t == "room":
+                        self.take_cmap(m)
                         self.room = m
                         self.me = int(m.get("you", 0))
                     elif t == "chat":
@@ -17321,7 +22556,10 @@ class Game:
                         self.mp_err = str(m.get("why", "The host said no."))[:120]
                         c.close()
                     elif t == "start":
-                        self.start_guest(m["map"], m["diff"], m["specs"], int(m["me"]))
+                        self.guest_start(m)
+                        return
+                    elif t == "obgo":
+                        self.guest_obgo(m)
                         return
                     elif t == "bye":
                         self.mp_err = "The host closed the room."
@@ -17334,6 +22572,139 @@ class Game:
                 self.leave_net()
                 self.back_to = "lobby"
                 self.goto("mp")
+
+    # ---- Blood Factory with friends: everybody climbs the same course at the same time, then the fight starts for all of you
+    def obmp_begin(self, specs, seed):
+        Hh = self.net[1]
+        pl = {}
+        for pid, sp in self.room_specs.items():
+            pl[pid] = dict(name=safe_name(sp.get("name", "?")) or "PLAYER", col=list(sp.get("col", WHITE))[:3], x=0.0, y=0.0, z=0.0, s=0.0, cp=0, done=False)
+        self.obmp = dict(host=True, me=0, pl=pl, specs=specs, seed=seed, tsend=0.0)
+        info = [dict(id=pid, name=p["name"], col=p["col"]) for pid, p in pl.items()]
+        for pid, c in Hh.conns.items():
+            c.send(dict(t="obgo", pl=info, me=pid))
+        self.bf_go_obby(mp=dict(me=0))
+
+    def guest_obgo(self, m):
+        pl = {}
+        for p in m.get("pl", [])[:4]:
+            try:
+                pl[int(p["id"])] = dict(name=safe_name(p.get("name", "?")) or "PLAYER", col=[int(clamp(v, 0, 255)) for v in list(p.get("col", WHITE))[:3]],
+                                        x=0.0, y=0.0, z=0.0, s=0.0, cp=0, done=False)
+            except Exception:
+                pass
+        me = int(m.get("me", 1))
+        self.obmp = dict(host=False, me=me, pl=pl, tsend=0.0)
+        self.bf_go_obby(mp=dict(me=me))
+
+    def obmp_done(self):
+        mp = self.obmp
+        o = self.ob
+        if mp is None or o is None:
+            return
+        me = mp["me"]
+        if me in mp["pl"]:
+            mp["pl"][me]["done"] = True
+        mp["tsend"] = 0.0
+
+    def obmp_leave(self):
+        self.obmp = None
+        self.leave_net()
+
+    def obmp_pump(self):
+        mp = self.obmp
+        o = self.ob
+        pl = mp["pl"]
+        me = mp["me"]
+        dt = min(self.dt, 0.1)
+        if o is not None and me in pl:
+            pl[me].update(x=o["x"], y=o["y"], z=o["z"], s=o["best_s"], cp=o["cp"], done=bool(o["finished"]))
+        for p in pl.values():
+            if "dx" not in p:
+                p["dx"], p["dy"], p["dz"] = p["x"], p["y"], p["z"]
+            else:
+                k = min(1.0, dt * 12.0)
+                p["dx"] += (p["x"] - p["dx"]) * k
+                p["dy"] += (p["y"] - p["dy"]) * k
+                p["dz"] += (p["z"] - p["dz"]) * k
+        mp["tsend"] -= dt
+        if mp["host"]:
+            Hh = self.net[1]
+            for pid, c in list(Hh.conns.items()):
+                for m in c.pump():
+                    if m.get("t") == "obp" and pid in pl:
+                        try:
+                            p = pl[pid]
+                            p["x"], p["y"], p["z"] = [clamp(float(m[k]), -20000.0, 20000.0) for k in ("x", "y", "z")]
+                            p["s"] = clamp(float(m.get("s", 0.0)), 0.0, 100000.0)
+                            p["cp"] = int(clamp(int(m.get("cp", 0)), 0, 20))
+                            p["done"] = bool(m.get("done"))
+                        except Exception:
+                            pass
+                if c.dead:
+                    del Hh.conns[pid]
+                    pl.pop(pid, None)
+                    self.room_specs.pop(pid, None)
+            if mp["tsend"] <= 0:
+                mp["tsend"] = 0.1
+                rows = [[pid, round(p["x"], 1), round(p["y"], 1), round(p["z"], 1), round(p["s"]), int(p["done"])] for pid, p in pl.items()]
+                for c in Hh.conns.values():
+                    c.send(dict(t="obs", pl=rows))
+            if o is None:
+                self.obmp = None
+                return
+            if o["finished"] and all(p["done"] for p in pl.values()):
+                self.obmp_launch()
+        else:
+            c = self.net[1]
+            for m in c.pump():
+                t = m.get("t")
+                try:
+                    if t == "obs":
+                        for row in m.get("pl", []):
+                            pid = int(row[0])
+                            if pid in pl and pid != me:
+                                p = pl[pid]
+                                p["x"], p["y"], p["z"] = [clamp(float(v), -20000.0, 20000.0) for v in row[1:4]]
+                                p["s"] = float(row[4])
+                                p["done"] = bool(row[5])
+                    elif t == "start":
+                        self.ob = None
+                        self.obmp = None
+                        self.guest_start(m)
+                        return
+                    elif t == "bye":
+                        self.mp_err = "The host closed the room."
+                        c.close()
+                except Exception:
+                    pass
+            if c.dead:
+                self.mp_err = self.mp_err or "Lost the connection to the host."
+                self.ob = None
+                self.leave_net()
+                self.back_to = "lobby"
+                self.goto("mp")
+                return
+            if mp["tsend"] <= 0 and o is not None:
+                mp["tsend"] = 0.1
+                c.send(dict(t="obp", x=round(o["x"], 1), y=round(o["y"], 1), z=round(o["z"], 1), s=round(o["best_s"]), cp=o["cp"], done=int(bool(o["finished"]))))
+
+    def obmp_launch(self):
+        """host: everybody is through the door (or you said go): the fight begins"""
+        mp = self.obmp
+        Hh = self.net[1]
+        specs, seed = mp["specs"], mp["seed"]
+        self.obmp = None
+        self.ob = None
+        self.start_game(self.room["map"], self.room["diff"], specs, seed, 0)
+        w = self.world
+        for i, P in enumerate(w.players):
+            if i and i not in Hh.conns:
+                P.here = False
+        real = [P.spec() for P in w.players]
+        for pid, c in Hh.conns.items():
+            c.send(dict(t="start", map=self.room["map"], cmap=MAP_BY_ID[self.room["map"]].get("raw"), diff=self.room["diff"], specs=real, me=pid))
+        Hh.beacon_t = 0.0
 
     def room_start(self):
         """host: everybody into the match"""
@@ -17353,11 +22724,36 @@ class Game:
         Hh.conns = conns
         self.room_specs = nspec
         seed = random.randrange(1 << 30)
+        if self.room.get("vs") and len(specs) >= 2:
+            # versus: everybody gets their own copy of the map, with the same waves
+            worlds = []
+            for sp in specs:
+                ow = World(self.room["map"], self.room["diff"], [self.safe_spec(sp)], seed)
+                ow.hz_on = True
+                ow.orb_on = True
+                ow.air_on = True
+                ow.sup_k = SUP_K
+                ow.nwaves = VS_WAVES
+                ow.build_t = MP_WAVE_DELAY - MP_FIRST_DELAY
+                ow.net = True
+                worlds.append(ow)
+            self.vsm = Versus(worlds)
+            self.world = worlds[0]
+            self.me = 0
+            self.begin_match()
+            for pid, c in Hh.conns.items():
+                c.send(dict(t="start", map=self.room["map"], cmap=MAP_BY_ID[self.room["map"]].get("raw"), diff=self.room["diff"],
+                            specs=[worlds[pid].players[0].spec()], me=0, vs=1, idx=pid))
+            Hh.beacon_t = 0.0
+            return
+        if self.room["map"] == "blood" and len(specs) >= 1:
+            self.obmp_begin(specs, seed)
+            return
         self.start_game(self.room["map"], self.room["diff"], specs, seed, 0)
         w = self.world
         real = [P.spec() for P in w.players]
         for pid, c in Hh.conns.items():
-            c.send(dict(t="start", map=self.room["map"], diff=self.room["diff"], specs=real, me=pid))
+            c.send(dict(t="start", map=self.room["map"], cmap=MAP_BY_ID[self.room["map"]].get("raw"), diff=self.room["diff"], specs=real, me=pid))
         Hh.beacon_t = 0.0
 
     def screen_room(self, s):
@@ -17382,6 +22778,8 @@ class Game:
         if diff not in DIFFS:
             diff = "normal"
         D = DIFFS[diff if not m.get("event") else "event"]
+        if m.get("dover"):
+            D = dict(D, **m["dover"])
         th = THEMES[m["theme"]]
         # ---- players
         L = pygame.Rect(40, 100, 600, 420)
@@ -17426,7 +22824,9 @@ class Game:
         draw_text(s, "Enemies have +%d%% health with %d players. Final boss: %dk." % (round(MP_HP * (n - 1) * 100), n, D["boss"] * (1 + MP_HP * (n - 1)) // 1000), 15, GREY, R.x + 20, R.y + 196, "l")
         if host:
             lv = self.level()
-            ok_maps = [mm for mm in MAIN_MAPS if mm["need"] <= lv]
+            ok_maps = [mm for mm in MAIN_MAPS if mm["need"] <= lv] + list(self.my_maps)
+            if "blood" in self.save["events"]:
+                ok_maps.append(MAP_BY_ID["blood"])
             draw_text(s, "MAP", 15, DIM, R.x + 20, R.y + 232, "l")
             step = 0
             if self.button("rm_prev", pygame.Rect(R.x + 20, R.y + 246, 60, 44), "<", CYAN, 28):
@@ -17443,11 +22843,23 @@ class Game:
                 if self.button("rm_d" + d, pygame.Rect(R.x + 180 + j * 122, R.y + 246, 114, 44), DIFFS[d]["name"], DIFFS[d]["col"] if room["diff"] == d else GREY, 20):
                     room["diff"] = d
                     self.room_broadcast()
-            if self.button("rm_start", pygame.Rect(R.x + 20, R.bottom - 100, R.w - 40, 80), "START", GREEN, 44, True, "%d player%s" % (n, "" if n == 1 else "s")):
+            draw_text(s, "MODE", 15, DIM, R.x + 20, R.y + 298, "l")
+            for j, (key, lab, col) in enumerate(((False, "CO-OP", GREEN), (True, "VERSUS", ORANGE))):
+                on = bool(room.get("vs")) == key
+                if self.button("rm_mode%d" % j, pygame.Rect(R.x + 20 + j * 132, R.y + 310, 124, 40), lab, col if on else GREY, 20, True, None, mix_col(PANEL, col, 0.25) if on else None):
+                    room["vs"] = key
+                    self.room_broadcast()
+            if room.get("vs"):
+                draw_text(s, "Everybody guards their own map and sends enemies to the next player.", 13, ORANGE, R.x + 290, R.y + 320, "l")
+                draw_text(s, "Last core standing wins.  Needs 2 or more players.", 13, GREY, R.x + 290, R.y + 338, "l")
+            vs_ok = (not room.get("vs")) or n >= 2
+            if self.button("rm_start", pygame.Rect(R.x + 20, R.bottom - 66, R.w - 40, 56), "START" if not room.get("vs") else "START VERSUS", GREEN, 36, vs_ok, "%d player%s" % (n, "" if n == 1 else "s")):
                 self.room_start()
                 return
         else:
             draw_text(s, "The host picks the map and starts the match.", 18, GREY, R.x + 20, R.y + 250, "l")
+            if room.get("vs"):
+                draw_text(s, "MODE: VERSUS - send enemies to the next player, last core standing wins", 15, ORANGE, R.x + 20, R.y + 290, "l")
             draw_text(s, "Waiting for the host" + "." * (1 + int(self.time * 2) % 3), 26, WHITE, R.centerx, R.bottom - 60)
         # ---- your loadout + chat
         B = pygame.Rect(40, 532, 600, 160)
@@ -17471,7 +22883,11 @@ class Game:
                 # the same look as chat in a match: the speaker's orb, their name, and blocked words in red
                 self.draw_orb(s, C.x + 24, y, 6, col)
                 nr = draw_text(s, name, 16, col, C.x + 38, y, "l")
-                draw_rich(s, text, 16, WHITE, nr.right + 8, y)
+                mood = e[6] if len(e) > 6 else "calm"
+                if mood == "calm":
+                    draw_rich(s, text, 16, WHITE, nr.right + 8, y)
+                else:
+                    draw_mood(s, text, 16, WHITE, nr.right + 8, y, 1.0, mood, self.time, self.time - e[3])
             else:
                 pygame.draw.polygon(s, col, poly(C.x + 24, y, 4, 4, 0))
                 draw_text(s, text, 15, mix_col(col, WHITE, 0.25), C.x + 38, y, "l")
@@ -17488,6 +22904,73 @@ class Game:
 
 
 CHANGELOG = [
+    ("v3.0.0  -  SOMETHING IN THE FACTORY", [
+        "Support towers are fixed. Commander and Beacon now really boost the towers near them: buffed towers show little red chevrons (and a cyan ring for a Beacon), and the buffs are stronger in real matches.",
+        "Rare red BLOODLUST enemies sometimes sneak into a wave. Somebody on a very green map is very interested in them.",
+        "...and something is waking up in a factory. Good luck. Bring friends.",
+    ]),
+    ("v2.13.0  -  ENDLESS MODE AND THE DAILY CHALLENGE", [
+        "New ENDLESS tab (next to MAPS): there is no final wave. A boss comes every 10 waves. The game saves your best wave on every map.",
+        "DAILY CHALLENGE: every day has one map and one twist (faster enemies, a weak core, flyers and more). Everybody gets the same one, so you can race your brother!",
+        "Reach wave 5 in the daily for a coin bonus. Play on consecutive days to grow your streak and the bonus.",
+        "In an endless run you can END THE RUN from the pause menu and still keep your coins and XP.",
+    ]),
+    ("v2.12.0  -  FLYING ENEMIES", [
+        "From wave 5, DRONES follow the road high up in the air. GUNSHIPS come at wave 10 and ZEPPELINS at wave 16.",
+        "Blade, Keyboard Cat, Mortar, Toaster, Jack-o-Cannon, Graviton, path towers and goons CAN'T hit flyers. Look for the NO FLYERS tag in the shop.",
+        "Blaster, Rail, Scatter, Tesla, Hydra, Prism, Cryo, Snowblower, Sentinel, Rubber Duck and Annihilator shoot them down. So do Summoner archers!",
+    ]),
+    ("v2.11.0  -  MORE GOONS FOR THE SUMMONER", [
+        "Point at your Summoner and press T (target key) to pick what it sends. Each level unlocks one more kind.",
+        "SHIELDS (level 2): big, slow and very tough. ARCHERS (level 3): weak, but they shoot enemies from a distance. HEALERS (level 4): mend the goons near them.",
+        "SQUAD (level 5): a mix of all of them. Level 1 and the King work like before.",
+    ]),
+    ("v2.10.0  -  YOUR ORB CAN FIGHT", [
+        "ORB SHOT: hold C (change it in CONTROLS) and your orb fires bolts at the mouse. It never pays hit cash, so it cannot be farmed.",
+        "DASH: press L-CTRL to zip forward. Enemies on the way are shoved back down their road and stunned for a moment. It recharges in 5 seconds.",
+        "New ORB cards join the card picks: Sharp Shots, Rapid Fire, Piercing, Quick Dash and Heavy Shove.",
+        "Works on Wi-Fi: friends see your shots and dash. Two small buttons by the abilities show when each one is ready.",
+    ]),
+    ("v2.9.0  -  HAZARDS, INDOOR LEVELS AND BIG EFFECTS", [
+        "LEVEL HAZARDS: every map now fights back from wave 3. A warning shows where it will hit, and a few seconds later it stuns or WRECKS the towers there.",
+        "City has an orbital railgun, Inferno has lava eruptions and a lava rise, Frostbite drops ice shards and an avalanche, Dunes have sandstorms, and every other map has its own.",
+        "A wrecked tower wakes up again by itself. A MECHANIC close by fixes it much faster, and path towers get repaired by it like always.",
+        "INDOOR LEVELS: Foundry, Motherboard, Corrupted Core, Crystal Cavern, Winter Works, The Kitchen, Stonk Market and Haunted Hollow now have walls, a roof and things hanging on them. Read the signs!",
+        "BIG EFFECTS: muzzle flashes, hit sparks, crit stars, smoky explosions, boss slams and EMP pulses, and a different show for every ability (sword, ice, napalm, black hole, repair, laser, overdrive).",
+        "Enemy deaths burst into shards, sparks, smoke and embers. A boss death is a huge show.",
+        "Stunned or wrecked towers smoke and spark. Everything shows up for friends on Wi-Fi too.",
+    ]),
+    ("v2.8.0  -  WATCH YOUR RIVAL + CHAT MOODS", [
+        "Every mood has its own particles: sparks and steam, confetti, rain clouds, floating hearts, bubbles, sweat drops, spinning question marks and more.",
+        "VERSUS: the list on the right now shows each player's cash, towers and enemies on their map, and how many enemies are coming for them.",
+        "Click a player in that list to WATCH their map live. You can still send enemies while watching. ESC or BACK returns to your own map.",
+        "CHAT MOODS: the way you type changes how it looks. !!!! = angry and shaking, ?! = surprised, !! = excited and bouncy, ... = sad or worried.",
+        "Also: ?? confused, ? curious, ! happy, ~ playful, <3 love, xD laughing, -_- bored, and :( :) faces. ALL CAPS is shouting.",
+    ]),
+    ("v2.7.0  -  VERSUS", [
+        "NEW MODE: VERSUS, for 2 to 4 players on Wi-Fi. In the room, the host picks CO-OP or VERSUS, then START VERSUS.",
+        "Everybody guards their OWN copy of the map, with the same waves. Nobody can touch anybody else's towers.",
+        "Spend cash to SEND enemies (F1-F6 or the orange buttons) down the next player's road: swarms, runners, tanks, shielders, elites and juggernauts.",
+        "Sending costs more the later it is, and every send also pays you a little extra cash at the end of each wave.",
+        "Enemies that leak cost the core exactly their health, like always. The LAST CORE STANDING WINS.",
+        "You earn coins and XP for how long you last, and more for winning. Skipping waves is off in versus.",
+    ]),
+    ("v2.6.0  -  THE MAP EDITOR", [
+        "NEW TAB: PLAY > MY MAPS. Draw your own maps, play them, and send them to friends.",
+        "Pick ROAD and click the edge of the map to start a road, then click where it turns. Raise the height for ramps and bridges.",
+        "Add hills with HILL (drag a box, pick 1-3 high). Pick a look from all 21 map styles. SAVE + TEST PLAY tries it at once.",
+        "A map can have a second road. The editor tells you in plain words when something is wrong.",
+        "COPY MAP CODE puts the map in your clipboard. A friend clicks PASTE A MAP CODE to get it.",
+        "On Wi-Fi the host can pick one of their own maps in the room, and everybody gets it automatically.",
+        "Your own maps give no coins or XP (so they cannot be farmed), but they count for fun.",
+    ]),
+    ("v2.5.0  -  THE KING OF THE GOONS", [
+        "You can only have ONE Summoner now (four max-level ones were winning whole runs by themselves).",
+        "A max-level Summoner can send the KING OF THE GOONS: a huge crowned goon with 12,000 health. It costs 20,000 cash.",
+        "Press F (or the gold button) while the Summoner is selected. After a King, the Summoner needs 60 seconds before the next one.",
+        "Each King costs 10,000 more than the last: 20k, 30k, 40k...",
+        "The King walks slowly and trades health with everything he meets. Selling the Summoner does not take him away.",
+    ]),
     ("v2.4.0  -  MARK TWO", [
         "NEW LOOK: every tower (all 5 levels of each) and every enemy was rebuilt in detail, and all 21 maps dress them in their",
         "own style: snow and ice on Frostbite Pass, sandstone and bronze on Dune Runner, lava-cracked basalt on Crossfire...",
